@@ -1,4 +1,4 @@
-# Open Alice
+`# Open Alice
 
 File-driven AI trading agent. All state (sessions, config, logs) stored as files — no database.
 
@@ -44,6 +44,7 @@ src/
 │   │       ├── alpaca/        # Alpaca (US equities)
 │   │       ├── ccxt/          # CCXT (100+ crypto exchanges)
 │   │       ├── ibkr/          # Interactive Brokers (TWS/Gateway)
+│   │       ├── tiger/         # Tiger Trade (US + HK stocks, RSA REST API)
 │   │       └── mock/          # In-memory test broker
 │   ├── analysis/              # Indicators, technical analysis, sandbox
 │   ├── news/                  # RSS collector + archive search

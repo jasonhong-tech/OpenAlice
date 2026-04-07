@@ -445,7 +445,11 @@ function TradeLog({ commits }: { commits: CommitWithAccount[] }) {
             ? 'bg-accent/15 text-accent'
             : commit.accountProvider === 'alpaca'
               ? 'bg-green/15 text-green'
-              : 'bg-bg-tertiary text-text-muted'
+              : commit.accountProvider === 'ibkr'
+                ? 'bg-orange-400/15 text-orange-400'
+                : commit.accountProvider === 'tiger'
+                  ? 'bg-yellow-400/15 text-yellow-400'
+                  : 'bg-bg-tertiary text-text-muted'
           return (
             <div key={commit.hash} className="border border-border rounded-lg bg-bg-secondary px-3 py-2.5">
               <div className="flex items-start gap-2">

@@ -11,6 +11,7 @@ import type { AccountConfig } from '../../../core/config.js'
 import { CcxtBroker } from './ccxt/CcxtBroker.js'
 import { AlpacaBroker } from './alpaca/AlpacaBroker.js'
 import { IbkrBroker } from './ibkr/IbkrBroker.js'
+import { TigerBroker } from './tiger/TigerBroker.js'
 
 // ==================== Subtitle field descriptor ====================
 
@@ -89,6 +90,20 @@ export const BROKER_REGISTRY: Record<string, BrokerRegistryEntry> = {
     subtitleFields: [
       { field: 'host', prefix: 'TWS ' },
       { field: 'port' },
+    ],
+    guardCategory: 'securities',
+  },
+  tiger: {
+    configSchema: TigerBroker.configSchema,
+    configFields: TigerBroker.configFields,
+    fromConfig: TigerBroker.fromConfig,
+    name: 'Tiger Trade (老虎证券)',
+    description: 'US equities, Hong Kong stocks (SEHK), ETFs, and HK derivatives via Tiger Open API.',
+    badge: 'TG',
+    badgeColor: 'text-yellow-400',
+    subtitleFields: [
+      { field: 'account' },
+      { field: 'paper', label: 'Paper', falseLabel: 'Live' },
     ],
     guardCategory: 'securities',
   },

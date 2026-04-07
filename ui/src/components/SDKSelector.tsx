@@ -168,8 +168,14 @@ export const SECURITIES_SDK_OPTIONS: SDKOption[] = [
     name: 'Interactive Brokers',
     description: 'Global multi-asset broker with access to 150+ markets in 33 countries.',
     badge: 'IB',
-    badgeColor: 'text-text-muted',
-    comingSoon: true,
+    badgeColor: 'text-orange-400',
+  },
+  {
+    id: 'tiger',
+    name: 'Tiger Trade (老虎证券)',
+    description: 'US equities, Hong Kong stocks (SEHK), ETFs, and HK derivatives via Tiger Open API.',
+    badge: 'TG',
+    badgeColor: 'text-yellow-400',
   },
   {
     id: 'schwab',
@@ -210,6 +216,13 @@ export const PLATFORM_TYPE_OPTIONS: SDKOption[] = [
     description: 'Professional-grade trading via TWS or IB Gateway. Stocks, options, futures, bonds.',
     badge: 'IB',
     badgeColor: 'text-orange-400',
+  },
+  {
+    id: 'tiger',
+    name: 'Tiger Trade (老虎证券)',
+    description: 'US equities, Hong Kong stocks (SEHK), ETFs, and HK derivatives via Tiger Open API.',
+    badge: 'TG',
+    badgeColor: 'text-yellow-400',
   },
 ]
 

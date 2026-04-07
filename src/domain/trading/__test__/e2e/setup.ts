@@ -29,6 +29,7 @@ function isPaper(acct: AccountConfig): boolean {
     case 'alpaca': return !!bc.paper
     case 'ccxt':   return !!(bc.sandbox || bc.demoTrading)
     case 'ibkr':   return !!bc.paper
+    case 'tiger':  return !!bc.paper
     default:       return false
   }
 }
@@ -40,6 +41,7 @@ function hasCredentials(acct: AccountConfig): boolean {
     case 'alpaca':
     case 'ccxt':   return !!bc.apiKey
     case 'ibkr':   return true  // no API key — auth via TWS/Gateway login
+    case 'tiger':  return !!(bc.tigerId && bc.privateKey)
     default:       return true
   }
 }
