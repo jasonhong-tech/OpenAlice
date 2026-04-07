@@ -505,14 +505,16 @@ export class TigerBroker implements IBroker {
 
     if (!symbol) throw new BrokerError('CONFIG', 'Contract must have a symbol to get a quote')
 
-    const data = await this.client.execute('brief', {
+    // Tiger quote endpoint: "quote_real_time" (not "brief")
+    // Response is a DIRECT LIST: data = [{symbol, latestPrice, ...}, ...]
+    const data = await this.client.execute('quote_real_time', {
       symbols: [symbol],
       include_hour_trading: false,
       lang: 'en_US',
     })
 
-    // Tiger wraps brief results in data.items[]
-    const items = extractItems<TigerQuoteBriefRaw>(data)
+    // quote_real_time returns data as a direct array (unlike other endpoints that use data.items[])
+    const items = Array.isArray(data) ? (data as TigerQuoteBriefRaw[]) : extractItems<TigerQuoteBriefRaw>(data)
     const raw = items.find(q => q.symbol === symbol) ?? items[0]
 
     if (!raw) {

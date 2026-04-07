@@ -320,42 +320,92 @@ export function tigerPositionToUnified(raw: TigerPositionRaw): Position {
 /**
  * Extract AccountInfo from Tiger assets response data.
  *
- * Tiger `assets` endpoint returns:
- *   data = { items: [{ netLiquidation, cashValue, buyingPower, ... }] }
+ * Handles multiple possible response formats (defensive parsing):
  *
- * All fields use camelCase in JSON. SPECIAL MAPPINGS (from ACCOUNT_FIELD_MAPPINGS):
- *   "cashValue"    → cash   (Tiger calls it cashValue)
- *   "initMarginReq"   → initial_margin_requirement
- *   "maintMarginReq"  → maintenance_margin_requirement
- *   "realizedPnL"  → realized_pnl
- *   "unrealizedPnL"→ unrealized_pnl
+ * Format A — `assets` endpoint (standard accounts):
+ *   data = { items: [{ netLiquidation, cashValue, buyingPower, initMarginReq, ... }] }
+ *   All fields are camelCase. SPECIAL MAPPINGS from ACCOUNT_FIELD_MAPPINGS:
+ *     cashValue → cash, initMarginReq → initial_margin_requirement, etc.
+ *
+ * Format B — `prime_assets` endpoint (prime/consolidated accounts):
+ *   data = { accountId, updateTimestamp, segments: [{ category, netLiquidation, buyingPower, ... }] }
+ *   Uses the stock segment (category="S") for equity account info.
+ *
+ * Format C — direct array (some Tiger API variants):
+ *   data = [{ netLiquidation, cashValue, ... }]
+ *
+ * Format D — flat single object:
+ *   data = { netLiquidation, cashValue, ... }
  */
 export function tigerAssetsToAccountInfo(data: unknown): AccountInfo {
-  // Tiger wraps the asset list in data.items (from assets_response.py)
-  const dataObj = data as Record<string, unknown> | null
-  const items = Array.isArray(dataObj?.items)
-    ? (dataObj!.items as TigerAssetRaw[])
-    : []
-  const asset = items[0] ?? ({} as TigerAssetRaw)
+  if (!data || typeof data !== 'object') {
+    return makeZeroAccountInfo()
+  }
 
+  const dataObj = data as Record<string, unknown>
+
+  // Format A: { items: [...] }  (standard assets endpoint)
+  if (Array.isArray(dataObj.items) && dataObj.items.length > 0) {
+    const asset = dataObj.items[0] as TigerAssetRaw
+    return extractFromFlatAsset(asset)
+  }
+
+  // Format B: { segments: [...] }  (prime_assets endpoint)
+  // Use stock segment (category "S") or first available segment
+  if (Array.isArray(dataObj.segments) && dataObj.segments.length > 0) {
+    const segs = dataObj.segments as Array<Record<string, unknown>>
+    const stockSeg = segs.find(s => s.category === 'S') ?? segs[0]
+    return {
+      netLiquidation: num(stockSeg.netLiquidation),
+      totalCashValue: num(stockSeg.cashBalance ?? stockSeg.cashAvailableForTrade),
+      unrealizedPnL: num(stockSeg.unrealizedPl ?? stockSeg.unrealizedPnl),
+      realizedPnL: num(stockSeg.realizedPl ?? stockSeg.realizedPnl),
+      buyingPower: num(stockSeg.buyingPower),
+      initMarginReq: num(stockSeg.initMargin ?? stockSeg.initMarginReq),
+      maintMarginReq: num(stockSeg.maintainMargin ?? stockSeg.maintMarginReq),
+      dayTradesRemaining: -1,
+    }
+  }
+
+  // Format C: direct array
+  if (Array.isArray(data) && data.length > 0) {
+    return extractFromFlatAsset(data[0] as TigerAssetRaw)
+  }
+
+  // Format D: flat single object (the dataObj itself IS the asset)
+  if (dataObj.netLiquidation !== undefined || dataObj.cashValue !== undefined) {
+    return extractFromFlatAsset(dataObj as TigerAssetRaw)
+  }
+
+  return makeZeroAccountInfo()
+}
+
+function extractFromFlatAsset(asset: TigerAssetRaw): AccountInfo {
   return {
-    // Tiger: "netLiquidation" (camelCase → net_liquidation)
-    netLiquidation: (asset.netLiquidation as number) ?? 0,
-    // Tiger: "cashValue" (SPECIAL MAPPING → cash)
-    totalCashValue: (asset.cashValue as number) ?? 0,
-    // Tiger: "unrealizedPnL" (SPECIAL MAPPING)
-    unrealizedPnL: (asset.unrealizedPnL as number) ?? 0,
-    // Tiger: "realizedPnL" (SPECIAL MAPPING)
-    realizedPnL: (asset.realizedPnL as number) ?? 0,
-    // Tiger: "buyingPower" (camelCase)
-    buyingPower: (asset.buyingPower as number) ?? (asset.availableFunds as number) ?? 0,
-    // Tiger: "initMarginReq" (SPECIAL MAPPING → initial_margin_requirement)
-    initMarginReq: (asset.initMarginReq as number) ?? 0,
-    // Tiger: "maintMarginReq" (SPECIAL MAPPING → maintenance_margin_requirement)
-    maintMarginReq: (asset.maintMarginReq as number) ?? 0,
-    // Tiger: "dayTradesRemaining" (camelCase)
+    netLiquidation: num(asset.netLiquidation),
+    // Tiger: "cashValue" is the special mapping for "cash" in ACCOUNT_FIELD_MAPPINGS
+    totalCashValue: num(asset.cashValue),
+    unrealizedPnL: num(asset.unrealizedPnL),
+    realizedPnL: num(asset.realizedPnL),
+    buyingPower: num(asset.buyingPower) || num(asset.availableFunds),
+    // Tiger: "initMarginReq" is the special mapping for "initial_margin_requirement"
+    initMarginReq: num(asset.initMarginReq),
+    maintMarginReq: num(asset.maintMarginReq),
     dayTradesRemaining: (asset.dayTradesRemaining as number) ?? -1,
   }
+}
+
+function makeZeroAccountInfo(): AccountInfo {
+  return {
+    netLiquidation: 0, totalCashValue: 0, unrealizedPnL: 0, realizedPnL: 0,
+    buyingPower: 0, initMarginReq: 0, maintMarginReq: 0, dayTradesRemaining: -1,
+  }
+}
+
+/** Safe number extraction — returns 0 for undefined/null/Infinity */
+function num(v: unknown): number {
+  if (typeof v === 'number' && isFinite(v)) return v
+  return 0
 }
 
 // ==================== Native key ====================

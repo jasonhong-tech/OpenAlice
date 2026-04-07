@@ -97,7 +97,11 @@ export class TigerClient {
       throw new BrokerError(classifyTigerErrorCode(json.code, json.message), errorMsg)
     }
 
-    return json.data
+    // Tiger inconsistently returns data as a JSON-encoded string (double-encoded) for some
+    // endpoints (e.g. assets, quote_real_time) and as a JSON object for others (e.g. contracts).
+    // Transparently parse the string here so all callers receive a plain JS value.
+    const raw = json.data
+    return typeof raw === 'string' ? JSON.parse(raw) : raw
   }
 }
 
