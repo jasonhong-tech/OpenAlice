@@ -130,6 +130,7 @@ export class TigerBroker implements IBroker {
 
   private readonly account: string
   private readonly client: TigerClient
+  private initialized = false
 
   constructor(config: TigerBrokerConfig) {
     this.id = config.id ?? 'tiger'
@@ -150,6 +151,8 @@ export class TigerBroker implements IBroker {
    * REST API — no persistent connection to establish.
    */
   async init(): Promise<void> {
+    if (this.initialized) return
+
     try {
       const data = await this.client.execute('accounts', {
         account: this.account,
@@ -158,6 +161,7 @@ export class TigerBroker implements IBroker {
       if (!data) {
         throw new BrokerError('AUTH', 'Tiger API returned no account data — check tigerId, privateKey, and account.')
       }
+      this.initialized = true
       console.log(`TigerBroker[${this.id}]: connected (account=${this.account})`)
     } catch (err) {
       if (err instanceof BrokerError) throw err
