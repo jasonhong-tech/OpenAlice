@@ -260,20 +260,23 @@ export class TigerBroker implements IBroker {
         lang: 'en_US',
       }) as TigerOrderIdData | null
 
-      const tigerOrderId = orderNoData?.order_id
+      // Tiger returns camelCase "orderId" in order_no response (snake_case "order_id" is fallback)
+      const tigerOrderId = orderNoData?.orderId ?? orderNoData?.order_id
       if (!tigerOrderId) {
         return { success: false, error: 'Failed to obtain order ID from Tiger API' }
       }
 
       // Step 2: place order
+      // Contract fields are FLAT in the biz_content (not nested as "contract: {...}")
+      // Quantity field name is "total_quantity" (not "quantity")
       const tigerContractParams = contractToTigerParams(contract)
       const bizContent: Record<string, unknown> = {
         account: this.account,
-        contract: tigerContractParams,
+        ...tigerContractParams,           // symbol, sec_type, currency, market, exchange
         action: order.action,
         order_type: ibkrOrderTypeToTiger(order.orderType ?? 'LMT'),
         order_id: tigerOrderId,
-        quantity: order.totalQuantity?.toNumber() ?? 0,
+        total_quantity: order.totalQuantity?.toNumber() ?? 0,
         time_in_force: order.tif ?? 'DAY',
         outside_rth: order.outsideRth ?? false,
         lang: 'en_US',
@@ -321,17 +324,18 @@ export class TigerBroker implements IBroker {
       }
 
       const orig = existing.order
+      // Contract fields are FLAT (not nested), quantity field is "total_quantity"
       const tigerContractParams = contractToTigerParams(existing.contract)
 
       const bizContent: Record<string, unknown> = {
         account: this.account,
         id: parseInt(orderId, 10),
-        contract: tigerContractParams,
+        ...tigerContractParams,           // symbol, sec_type, currency, market, exchange
         action: orig.action,
         order_type: ibkrOrderTypeToTiger(
           (changes.orderType ?? orig.orderType) ?? 'LMT',
         ),
-        quantity: (changes.totalQuantity ?? orig.totalQuantity)?.toNumber() ?? 0,
+        total_quantity: (changes.totalQuantity ?? orig.totalQuantity)?.toNumber() ?? 0,
         limit_price: changes.lmtPrice ?? orig.lmtPrice,
         aux_price: changes.auxPrice ?? orig.auxPrice,
         time_in_force: changes.tif ?? orig.tif ?? 'DAY',

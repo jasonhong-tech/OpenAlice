@@ -38,9 +38,11 @@ export interface TigerApiResponse {
 }
 
 export interface TigerOrderIdData {
-  id?: number
-  order_id?: number   // from order_no endpoint (snake_case in that specific response)
-  sub_ids?: number[]
+  id?: number           // global Tiger order ID (int64) — present in place_order response
+  orderId?: number      // account-level order ID — camelCase (primary from order_no)
+  order_id?: number     // account-level order ID — snake_case fallback (some API versions)
+  subIds?: number[]     // sub-order IDs (camelCase)
+  sub_ids?: number[]    // sub-order IDs (snake_case fallback)
 }
 
 /**
