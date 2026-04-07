@@ -4,6 +4,9 @@
  * Tiger API uses its own contract/order format; IBroker uses @traderalice/ibkr types.
  * These helpers translate between them so TigerBroker can satisfy IBroker without
  * leaking Tiger-specific shapes to the rest of the codebase.
+ *
+ * NOTE: All "Raw" types use camelCase keys as they appear in the Tiger JSON.
+ * See tiger-types.ts for full field name documentation and mapping notes.
  */
 
 import {
@@ -63,7 +66,6 @@ export function contractToTigerParams(contract: Contract): Record<string, unknow
 
 /**
  * Convert IBKR secType to Tiger sec_type.
- * Most values are identical; WAR (warrants) → Tiger "WAR", IBKR lacks IOPT (HK bull/bear certs).
  */
 function ibkrSecTypeToTiger(secType: string): string {
   const map: Record<string, string> = {
@@ -98,18 +100,21 @@ function tigerSecTypeToIbkr(secType: string): string {
 
 /**
  * Build an IBKR Contract from a Tiger contract response object.
+ * Tiger contract JSON uses camelCase: secType, primaryExchange, conid, etc.
  */
 export function tigerContractToIbkr(raw: TigerContractRaw): Contract {
   const c = new Contract()
-  c.symbol = raw.symbol
-  c.secType = tigerSecTypeToIbkr(raw.sec_type ?? 'STK')
+  c.symbol = raw.symbol ?? ''
+  // Tiger uses "secType" (camelCase) in JSON responses
+  c.secType = tigerSecTypeToIbkr(raw.secType ?? 'STK')
   c.currency = raw.currency ?? 'USD'
 
-  // Map Tiger exchange codes to IBKR exchange names
-  const exchange = raw.exchange ?? raw.primary_exchange
+  // Tiger uses "primaryExchange" in contract responses (camelCase)
+  const exchange = raw.exchange ?? raw.primaryExchange
   if (exchange) c.exchange = tigerExchangeToIbkr(exchange)
 
-  c.localSymbol = raw.identifier ?? raw.symbol
+  // "identifier" is the local/exchange symbol; "conid" is the internal ID
+  c.localSymbol = raw.identifier ?? raw.symbol ?? ''
   if (raw.multiplier != null) c.multiplier = String(raw.multiplier)
 
   return c
@@ -161,19 +166,26 @@ function tigerExchangeToIbkr(exchange: string): string {
 
 /**
  * Build IBKR Order fields from Tiger order response.
+ * Tiger order JSON uses camelCase: orderId, orderType, totalQuantity, limitPrice, etc.
  */
 export function tigerOrderToIbkr(raw: TigerOrderRaw): Order {
   const o = new Order()
-  o.orderId = raw.order_id ?? 0
+  // Tiger uses "orderId" (camelCase) in order JSON
+  o.orderId = raw.orderId ?? 0
   o.action = (raw.action ?? 'BUY') as 'BUY' | 'SELL'
-  o.orderType = tigerOrderTypeToIbkr(raw.order_type ?? 'LMT')
-  o.totalQuantity = new Decimal(raw.quantity ?? 0)
-  if (raw.limit_price != null) o.lmtPrice = raw.limit_price
-  if (raw.aux_price != null) o.auxPrice = raw.aux_price
-  if (raw.trail_stop_price != null) o.trailingPercent = raw.trail_stop_price
-  if (raw.trailing_percent != null) o.trailingPercent = raw.trailing_percent
-  o.tif = raw.time_in_force ?? 'DAY'
-  o.outsideRth = raw.outside_rth ?? false
+  // Tiger uses "orderType" (camelCase)
+  o.orderType = tigerOrderTypeToIbkr(raw.orderType ?? 'LMT')
+  // Tiger uses "totalQuantity" (camelCase) for order quantity
+  o.totalQuantity = new Decimal(raw.totalQuantity ?? 0)
+  // Tiger uses "limitPrice" (camelCase)
+  if (raw.limitPrice != null) o.lmtPrice = raw.limitPrice
+  if (raw.auxPrice != null) o.auxPrice = raw.auxPrice
+  if (raw.trailStopPrice != null) o.trailStopPrice = raw.trailStopPrice
+  if (raw.trailingPercent != null) o.trailingPercent = raw.trailingPercent
+  // Tiger uses "timeInForce" (camelCase)
+  o.tif = raw.timeInForce ?? 'DAY'
+  // Tiger uses "outsideRth" (camelCase)
+  o.outsideRth = raw.outsideRth ?? false
   if (raw.account) o.account = raw.account
   return o
 }
@@ -239,78 +251,110 @@ function tigerStatusToIbkr(status: string): string {
 
 /**
  * Build an OpenOrder from a Tiger order raw response.
+ *
+ * IMPORTANT: Tiger order JSON has contract fields (symbol, currency, secType)
+ * FLAT at the top level — there is no nested "contract" sub-object.
  */
 export function tigerOrderToOpenOrder(raw: TigerOrderRaw): OpenOrder {
-  const contract = raw.contract
-    ? tigerContractToIbkr(raw.contract)
-    : buildContractFromOrderRaw(raw)
+  // Contract info comes from flat fields on the order JSON
+  const c = new Contract()
+  c.symbol = raw.symbol ?? ''
+  // Tiger uses "secType" (camelCase) even in order responses
+  c.secType = tigerSecTypeToIbkr(raw.secType ?? 'STK')
+  c.currency = raw.currency ?? 'USD'
+  if (raw.exchange) c.exchange = tigerExchangeToIbkr(raw.exchange)
 
   const order = tigerOrderToIbkr(raw)
   const orderState = tigerStatusToOrderState(raw.status ?? '')
 
   return {
-    contract,
+    contract: c,
     order,
     orderState,
-    avgFillPrice: raw.avg_fill_price,
+    // Tiger uses "avgFillPrice" (camelCase)
+    avgFillPrice: raw.avgFillPrice,
   }
-}
-
-/** Fallback: build a minimal Contract from order-level symbol/currency fields. */
-function buildContractFromOrderRaw(raw: TigerOrderRaw): Contract {
-  const c = new Contract()
-  c.symbol = raw.symbol ?? ''
-  c.secType = 'STK'
-  c.currency = 'USD'
-  return c
 }
 
 // ==================== Position conversion ====================
 
 /**
  * Convert a Tiger position to the unified Position type.
+ *
+ * IMPORTANT: Tiger position JSON has contract fields (symbol, currency, secType)
+ * FLAT at the top level — there is no nested "contract" sub-object.
+ * SPECIAL field name mappings (from POSITION_FIELD_MAPPINGS in positions_response.py):
+ *   "position"    → quantity  (Tiger calls the qty field "position")
+ *   "latestPrice" → market_price
  */
 export function tigerPositionToUnified(raw: TigerPositionRaw): Position {
-  const contract = raw.contract
-    ? tigerContractToIbkr(raw.contract)
-    : new Contract()
+  const c = new Contract()
+  c.symbol = raw.symbol ?? ''
+  // Tiger uses "secType" (camelCase) in position responses
+  c.secType = tigerSecTypeToIbkr(raw.secType ?? 'STK')
+  c.currency = raw.currency ?? 'USD'
+  if (raw.exchange) c.exchange = tigerExchangeToIbkr(raw.exchange)
+  c.localSymbol = raw.identifier ?? raw.symbol ?? ''
 
-  const qty = raw.quantity ?? 0
+  // Tiger calls the quantity field "position" (SPECIAL MAPPING)
+  const qty = raw.position ?? 0
   return {
-    contract,
+    contract: c,
     side: qty >= 0 ? 'long' : 'short',
     quantity: new Decimal(Math.abs(qty)),
-    avgCost: raw.average_cost ?? 0,
-    marketPrice: raw.market_price ?? 0,
-    marketValue: Math.abs(raw.market_value ?? 0),
-    unrealizedPnL: raw.unrealized_pnl ?? 0,
-    realizedPnL: raw.realized_pnl ?? 0,
+    // Tiger calls average cost "averageCost" (camelCase)
+    avgCost: raw.averageCost ?? 0,
+    // Tiger calls market price "latestPrice" (SPECIAL MAPPING)
+    marketPrice: raw.latestPrice ?? 0,
+    // Tiger calls market value "marketValue" (camelCase)
+    marketValue: Math.abs(raw.marketValue ?? 0),
+    // Tiger uses "unrealizedPnl" (camelCase, lowercase l)
+    unrealizedPnL: raw.unrealizedPnl ?? 0,
+    // Tiger uses "realizedPnl" (camelCase, lowercase l)
+    realizedPnL: raw.realizedPnl ?? 0,
   }
 }
 
 // ==================== Account info conversion ====================
 
 /**
- * Extract AccountInfo from Tiger assets response.
- * Tiger's assets endpoint returns a PortfolioAccount with a summary.
+ * Extract AccountInfo from Tiger assets response data.
+ *
+ * Tiger `assets` endpoint returns:
+ *   data = { items: [{ netLiquidation, cashValue, buyingPower, ... }] }
+ *
+ * All fields use camelCase in JSON. SPECIAL MAPPINGS (from ACCOUNT_FIELD_MAPPINGS):
+ *   "cashValue"    → cash   (Tiger calls it cashValue)
+ *   "initMarginReq"   → initial_margin_requirement
+ *   "maintMarginReq"  → maintenance_margin_requirement
+ *   "realizedPnL"  → realized_pnl
+ *   "unrealizedPnL"→ unrealized_pnl
  */
 export function tigerAssetsToAccountInfo(data: unknown): AccountInfo {
-  // Tiger `assets` response wraps in a list with a summary object
-  const items = Array.isArray(data) ? data : []
-  const summary = (items[0] as Record<string, unknown>)?.summary as TigerAssetRaw | undefined
-
-  // Fallback: try data directly as an asset summary
-  const asset: TigerAssetRaw = summary ?? (data as TigerAssetRaw) ?? {}
+  // Tiger wraps the asset list in data.items (from assets_response.py)
+  const dataObj = data as Record<string, unknown> | null
+  const items = Array.isArray(dataObj?.items)
+    ? (dataObj!.items as TigerAssetRaw[])
+    : []
+  const asset = items[0] ?? ({} as TigerAssetRaw)
 
   return {
-    netLiquidation: asset.net_liquidation ?? 0,
-    totalCashValue: asset.cash ?? 0,
-    unrealizedPnL: 0, // Not directly in assets; comes from positions
-    realizedPnL: 0,
-    buyingPower: asset.buying_power ?? asset.available_funds ?? 0,
-    initMarginReq: asset.initial_margin_requirement ?? 0,
-    maintMarginReq: asset.maintenance_margin_requirement ?? 0,
-    dayTradesRemaining: asset.day_trades_remaining ?? -1,
+    // Tiger: "netLiquidation" (camelCase → net_liquidation)
+    netLiquidation: (asset.netLiquidation as number) ?? 0,
+    // Tiger: "cashValue" (SPECIAL MAPPING → cash)
+    totalCashValue: (asset.cashValue as number) ?? 0,
+    // Tiger: "unrealizedPnL" (SPECIAL MAPPING)
+    unrealizedPnL: (asset.unrealizedPnL as number) ?? 0,
+    // Tiger: "realizedPnL" (SPECIAL MAPPING)
+    realizedPnL: (asset.realizedPnL as number) ?? 0,
+    // Tiger: "buyingPower" (camelCase)
+    buyingPower: (asset.buyingPower as number) ?? (asset.availableFunds as number) ?? 0,
+    // Tiger: "initMarginReq" (SPECIAL MAPPING → initial_margin_requirement)
+    initMarginReq: (asset.initMarginReq as number) ?? 0,
+    // Tiger: "maintMarginReq" (SPECIAL MAPPING → maintenance_margin_requirement)
+    maintMarginReq: (asset.maintMarginReq as number) ?? 0,
+    // Tiger: "dayTradesRemaining" (camelCase)
+    dayTradesRemaining: (asset.dayTradesRemaining as number) ?? -1,
   }
 }
 

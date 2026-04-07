@@ -3,6 +3,10 @@
  *
  * Tiger Trade uses REST API with RSA-signed requests.
  * Auth: tiger_id + RSA private key (PKCS#1 base64 DER or PEM).
+ *
+ * IMPORTANT — All raw API response shapes use camelCase field names, matching
+ * the actual Tiger JSON. Field names here are derived from the Python SDK's
+ * response parsing code (assets_response.py, positions_response.py, etc.).
  */
 
 // ==================== Config ====================
@@ -35,94 +39,166 @@ export interface TigerApiResponse {
 
 export interface TigerOrderIdData {
   id?: number
-  order_id?: number
+  order_id?: number   // from order_no endpoint (snake_case in that specific response)
   sub_ids?: number[]
 }
 
+/**
+ * Tiger contract raw shape — camelCase keys from Tiger API JSON.
+ * Source: contracts_response.py (CONTRACT_FIELD_MAPPINGS: conid→contract_id, right→put_call)
+ */
 export interface TigerContractRaw {
-  symbol: string
+  symbol?: string
   identifier?: string
   currency?: string
-  sec_type?: string
+  secType?: string         // camelCase — maps to IBKR secType
   exchange?: string
-  primary_exchange?: string
+  primaryExchange?: string // camelCase
   market?: string
   name?: string
   multiplier?: number
-  lot_size?: number
-  contract_id?: number
+  lotSize?: number
+  conid?: number           // camelCase — Tiger's internal contract ID
+  right?: string           // for options: CALL/PUT
+  expiry?: string
+  strike?: number
 }
 
+/**
+ * Tiger position raw shape — camelCase keys from Tiger API JSON.
+ * Source: positions_response.py
+ * SPECIAL MAPPINGS (from POSITION_FIELD_MAPPINGS):
+ *   "position"    → quantity
+ *   "latestPrice" → market_price
+ * All other fields are camelCase (converted to snake_case by Python's camel_to_underline).
+ */
 export interface TigerPositionRaw {
   account?: string
-  contract?: TigerContractRaw
-  quantity?: number
-  average_cost?: number
-  market_price?: number
-  market_value?: number
-  realized_pnl?: number
-  unrealized_pnl?: number
-  salable_qty?: number
-}
-
-export interface TigerOrderRaw {
-  id?: number
-  order_id?: number
-  account?: string
   symbol?: string
-  action?: string
-  order_type?: string
-  quantity?: number
-  filled?: number
-  remaining?: number
-  limit_price?: number
-  aux_price?: number
-  trail_stop_price?: number
-  trailing_percent?: number
-  avg_fill_price?: number
-  time_in_force?: string
-  outside_rth?: boolean
+  currency?: string
+  secType?: string         // camelCase
+  exchange?: string
+  market?: string
+  identifier?: string
+  position?: number        // SPECIAL: Tiger calls it "position", maps to quantity
+  latestPrice?: number     // SPECIAL: maps to market_price
+  averageCost?: number     // camelCase → average_cost
+  marketValue?: number     // camelCase → market_value
+  unrealizedPnl?: number   // camelCase (lowercase l) → unrealized_pnl
+  realizedPnl?: number     // camelCase (lowercase l) → realized_pnl
+  salableQty?: number      // camelCase → salable_qty
+}
+
+/**
+ * Tiger order raw shape — camelCase keys from Tiger API JSON.
+ * Source: orders_response.py (ORDER_FIELD_MAPPINGS)
+ * Contract fields (symbol, currency, secType, exchange) are FLAT in the order JSON,
+ * not nested in a "contract" sub-object.
+ * SPECIAL MAPPINGS:
+ *   "orderId"        → order_id
+ *   "orderType"      → order_type
+ *   "limitPrice"     → limit_price
+ *   "auxPrice"       → aux_price
+ *   "totalQuantity"  → quantity
+ *   "timeInForce"    → time_in_force
+ *   "outsideRth"     → outside_rth
+ *   "avgFillPrice"   → avg_fill_price
+ *   "openTime"       → order_time
+ *   "latestTime"     → trade_time
+ *   "trailStopPrice" → trail_stop_price
+ *   "trailingPercent"→ trailing_percent
+ */
+export interface TigerOrderRaw {
+  id?: number              // global Tiger order ID (int64)
+  orderId?: number         // account-level order ID
+  account?: string
+  // Contract fields (flat, not nested):
+  symbol?: string
+  currency?: string
+  secType?: string
+  exchange?: string
+  // Order fields:
+  action?: string          // BUY | SELL
+  orderType?: string       // LMT | MKT | STP | ...
+  totalQuantity?: number   // SPECIAL: maps to quantity
+  filledQuantity?: number  // SPECIAL: maps to filled
+  limitPrice?: number      // SPECIAL: maps to limit_price
+  auxPrice?: number        // SPECIAL: maps to aux_price
+  trailStopPrice?: number  // SPECIAL: maps to trail_stop_price
+  trailingPercent?: number // SPECIAL: maps to trailing_percent
+  avgFillPrice?: number    // SPECIAL: maps to avg_fill_price
+  timeInForce?: string     // SPECIAL: maps to time_in_force
+  outsideRth?: boolean     // SPECIAL: maps to outside_rth
   status?: string
-  order_time?: number
-  update_time?: number
-  trade_time?: number
-  contract?: TigerContractRaw
-  reason?: string
+  openTime?: number        // SPECIAL: maps to order_time
+  updateTime?: number
+  latestTime?: number      // SPECIAL: maps to trade_time
+  remark?: string          // SPECIAL: maps to reason
 }
 
+/**
+ * Tiger assets raw shape — camelCase keys from Tiger API JSON.
+ * Source: assets_response.py (ACCOUNT_FIELD_MAPPINGS)
+ * Tiger API returns: data = { items: [TigerAssetRaw, ...] }
+ * SPECIAL MAPPINGS (from ACCOUNT_FIELD_MAPPINGS):
+ *   "cashValue"    → cash
+ *   "initMarginReq"   → initial_margin_requirement
+ *   "maintMarginReq"  → maintenance_margin_requirement
+ *   "realizedPnL"  → realized_pnl
+ *   "unrealizedPnL"→ unrealized_pnl
+ * All other fields: camelCase → snake_case via camel_to_underline
+ */
 export interface TigerAssetRaw {
-  net_liquidation?: number
-  cash?: number
-  buying_power?: number
-  available_funds?: number
-  initial_margin_requirement?: number
-  maintenance_margin_requirement?: number
-  day_trades_remaining?: number
-  excess_liquidity?: number
-  gross_position_value?: number
+  netLiquidation?: number    // camelCase → net_liquidation
+  cashValue?: number         // SPECIAL → cash (Tiger calls it cashValue)
+  buyingPower?: number       // camelCase → buying_power
+  availableFunds?: number    // camelCase → available_funds
+  initMarginReq?: number     // SPECIAL → initial_margin_requirement
+  maintMarginReq?: number    // SPECIAL → maintenance_margin_requirement
+  dayTradesRemaining?: number // camelCase → day_trades_remaining
+  realizedPnL?: number       // SPECIAL → realized_pnl
+  unrealizedPnL?: number     // SPECIAL → unrealized_pnl
+  grossPositionValue?: number
+  excessLiquidity?: number
 }
 
+/**
+ * Tiger quote brief raw shape — camelCase keys from Tiger API JSON.
+ * Source: quote_brief_response.py (BRIEF_FIELD_MAPPINGS)
+ * Tiger API returns: data = { items: [TigerQuoteBriefRaw, ...] }
+ * SPECIAL MAPPINGS (from BRIEF_FIELD_MAPPINGS):
+ *   "latestPrice" → latest_price
+ *   "preClose"    → prev_close  (NOTE: "preClose" not "prevClose")
+ *   "timestamp"   → latest_time (NOTE: "timestamp" not "latestTime")
+ *   "askPrice"    → ask_price
+ *   "askSize"     → ask_size
+ *   "bidPrice"    → bid_price
+ *   "bidSize"     → bid_size
+ *   "secType"     → sec_type
+ */
 export interface TigerQuoteBriefRaw {
   symbol?: string
   market?: string
-  sec_type?: string
-  latest_price?: number
-  prev_close?: number
-  latest_time?: number
+  secType?: string
+  name?: string
+  latestPrice?: number     // SPECIAL: → latest_price
+  preClose?: number        // SPECIAL: → prev_close (Tiger calls it "preClose")
+  timestamp?: number       // SPECIAL: → latest_time (Tiger calls it "timestamp")
   volume?: number
-  open_price?: number
-  high_price?: number
-  low_price?: number
-  bid_price?: number
-  ask_price?: number
-  bid_size?: number
-  ask_size?: number
-  halted?: number
+  openPrice?: number       // camelCase → open_price
+  highPrice?: number       // camelCase → high_price
+  lowPrice?: number        // camelCase → low_price
+  bidPrice?: number        // SPECIAL: → bid_price
+  askPrice?: number        // SPECIAL: → ask_price
+  bidSize?: number         // SPECIAL: → bid_size
+  askSize?: number         // SPECIAL: → ask_size
+  halted?: number          // 0=normal, 3=halt, 4=delisted
+  change?: number
 }
 
 export interface TigerMarketStatusRaw {
   market?: string
   status?: string
-  trading_status?: string
-  open_time?: number
+  tradingStatus?: string   // camelCase
+  openTime?: number        // camelCase
 }

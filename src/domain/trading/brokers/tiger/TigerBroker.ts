@@ -10,6 +10,9 @@
  * - Order IDs: Tiger returns large int64 global IDs; we use those as string orderIds
  * - HK stocks: symbol format "00700", exchange "SEHK", currency HKD
  * - Order ID pre-allocation: place_order requires a pre-fetched order_id from order_no
+ *
+ * Tiger API response structure: all arrays are wrapped in { items: [...] }
+ * All JSON field names are camelCase (e.g. netLiquidation, cashValue, latestPrice).
  */
 
 import { z } from 'zod'
@@ -50,6 +53,18 @@ import type {
   TigerMarketStatusRaw,
   TigerOrderIdData,
 } from './tiger-types.js'
+
+/**
+ * Extract items from a Tiger API response.
+ * Tiger wraps all lists in: data = { items: [...] }
+ * But some endpoints return a list directly or a single object.
+ */
+function extractItems<T>(data: unknown): T[] {
+  if (Array.isArray(data)) return data as T[]
+  const obj = data as Record<string, unknown> | null
+  if (obj && Array.isArray(obj.items)) return obj.items as T[]
+  return []
+}
 
 export class TigerBroker implements IBroker {
   // ---- Self-registration ----
@@ -180,6 +195,8 @@ export class TigerBroker implements IBroker {
    *
    * Tiger does not offer fuzzy symbol search (unlike IBKR reqMatchingSymbols).
    * We treat `pattern` as an exact symbol lookup. Returns empty if not found.
+   *
+   * Tiger response: data = { items: [TigerContractRaw, ...] }
    */
   async searchContracts(pattern: string): Promise<ContractDescription[]> {
     if (!pattern) return []
@@ -192,8 +209,8 @@ export class TigerBroker implements IBroker {
         lang: 'en_US',
       })
 
-      const items = Array.isArray(data) ? data : []
-      return (items as TigerContractRaw[]).map(tigerContractToDescription)
+      // Tiger wraps contract results in data.items[]
+      return extractItems<TigerContractRaw>(data).map(tigerContractToDescription)
     } catch {
       return []
     }
@@ -217,8 +234,8 @@ export class TigerBroker implements IBroker {
 
       if (!data) return null
 
-      const items = Array.isArray(data) ? data : [data]
-      const raw = items[0] as TigerContractRaw | undefined
+      const items = extractItems<TigerContractRaw>(data)
+      const raw = items[0] ?? (data as TigerContractRaw)
       return raw ? tigerContractToDetails(raw) : null
     } catch {
       return null
@@ -326,7 +343,7 @@ export class TigerBroker implements IBroker {
         bizContent.trailing_percent = changes.trailingPercent
       }
 
-      const data = await this.client.execute('modify_order', bizContent) as TigerOrderIdData | null
+      await this.client.execute('modify_order', bizContent)
 
       const os = new OrderState()
       os.status = 'Submitted'
@@ -385,7 +402,9 @@ export class TigerBroker implements IBroker {
   /**
    * Get account summary (net liquidation, buying power, margins, etc.).
    *
-   * Uses Tiger's `assets` endpoint, which returns a PortfolioAccount with a summary.
+   * Uses Tiger's `assets` endpoint.
+   * Tiger response: data = { items: [{ netLiquidation, cashValue, buyingPower, ... }] }
+   * All fields in the item use camelCase (not snake_case).
    */
   async getAccount(): Promise<AccountInfo> {
     const data = await this.client.execute('assets', {
@@ -398,7 +417,9 @@ export class TigerBroker implements IBroker {
   /**
    * Get current open positions.
    *
-   * Uses Tiger's `positions` endpoint. Returns US + HK positions combined.
+   * Tiger response: data = { items: [TigerPositionRaw, ...] }
+   * Contract fields (symbol, currency, secType) are FLAT on each position item.
+   * Position quantity uses field name "position" (not "quantity").
    */
   async getPositions(): Promise<Position[]> {
     const data = await this.client.execute('positions', {
@@ -409,9 +430,9 @@ export class TigerBroker implements IBroker {
       lang: 'en_US',
     })
 
-    const items = Array.isArray(data) ? data : []
-    return (items as TigerPositionRaw[])
-      .filter(p => (p.quantity ?? 0) !== 0)
+    return extractItems<TigerPositionRaw>(data)
+      // Tiger uses "position" field for quantity (SPECIAL MAPPING)
+      .filter(p => (p.position ?? 0) !== 0)
       .map(tigerPositionToUnified)
   }
 
@@ -430,6 +451,7 @@ export class TigerBroker implements IBroker {
   /**
    * Get a single order by global ID.
    * Tiger's `orders` endpoint accepts `id` (global int64) or `order_id` (account-level).
+   * Response may be { items: [...] } for multiple orders, or a flat object for a single order.
    */
   async getOrder(orderId: string): Promise<OpenOrder | null> {
     try {
@@ -439,10 +461,28 @@ export class TigerBroker implements IBroker {
         lang: 'en_US',
       })
 
-      // Response may be a list or a single order
-      const items = Array.isArray(data) ? data : data ? [data] : []
-      const raw = items[0] as TigerOrderRaw | undefined
-      return raw ? tigerOrderToOpenOrder(raw) : null
+      if (!data) return null
+
+      const dataObj = data as Record<string, unknown>
+
+      // Handle { items: [...] } structure
+      if (Array.isArray(dataObj.items)) {
+        const raw = (dataObj.items as TigerOrderRaw[])[0]
+        return raw ? tigerOrderToOpenOrder(raw) : null
+      }
+
+      // Handle direct list
+      if (Array.isArray(data)) {
+        const raw = (data as TigerOrderRaw[])[0]
+        return raw ? tigerOrderToOpenOrder(raw) : null
+      }
+
+      // Handle single flat order object (Tiger returns this when querying by id)
+      if (dataObj.symbol || dataObj.id) {
+        return tigerOrderToOpenOrder(dataObj as TigerOrderRaw)
+      }
+
+      return null
     } catch {
       return null
     }
@@ -451,11 +491,18 @@ export class TigerBroker implements IBroker {
   /**
    * Get a real-time quote for a contract.
    *
-   * Uses Tiger's `brief` endpoint which returns latest price, bid/ask, volume, high/low.
-   * HK stocks get bid/ask from the order book; US stocks get NBBO quotes.
+   * Resolves symbol from contract.symbol, contract.localSymbol, or contract.aliceId.
+   * Tiger response for `brief`: data = { items: [TigerQuoteBriefRaw, ...] }
+   * Quote fields use camelCase: latestPrice, preClose, timestamp, bidPrice, askPrice, etc.
    */
   async getQuote(contract: Contract): Promise<Quote> {
-    const symbol = contract.symbol ?? ''
+    // Resolve symbol — also handles aliceId-only contracts (e.g. aliceId="AVGO")
+    const aliceId = contract.aliceId ?? ''
+    const symbol = contract.symbol
+      || contract.localSymbol
+      || (aliceId.includes('|') ? aliceId.split('|')[1] : aliceId)
+      || ''
+
     if (!symbol) throw new BrokerError('CONFIG', 'Contract must have a symbol to get a quote')
 
     const data = await this.client.execute('brief', {
@@ -464,8 +511,9 @@ export class TigerBroker implements IBroker {
       lang: 'en_US',
     })
 
-    const items = Array.isArray(data) ? data : []
-    const raw = (items as TigerQuoteBriefRaw[]).find(q => q.symbol === symbol)
+    // Tiger wraps brief results in data.items[]
+    const items = extractItems<TigerQuoteBriefRaw>(data)
+    const raw = items.find(q => q.symbol === symbol) ?? items[0]
 
     if (!raw) {
       throw new BrokerError('EXCHANGE', `No quote returned for ${symbol}`)
@@ -473,13 +521,19 @@ export class TigerBroker implements IBroker {
 
     return {
       contract,
-      last: raw.latest_price ?? 0,
-      bid: raw.bid_price ?? 0,
-      ask: raw.ask_price ?? 0,
+      // Tiger: "latestPrice" (SPECIAL MAPPING in BRIEF_FIELD_MAPPINGS → latest_price)
+      last: raw.latestPrice ?? 0,
+      // Tiger: "bidPrice" (SPECIAL MAPPING → bid_price)
+      bid: raw.bidPrice ?? 0,
+      // Tiger: "askPrice" (SPECIAL MAPPING → ask_price)
+      ask: raw.askPrice ?? 0,
       volume: raw.volume ?? 0,
-      high: raw.high_price,
-      low: raw.low_price,
-      timestamp: raw.latest_time ? new Date(raw.latest_time) : new Date(),
+      // Tiger: "highPrice" (camelCase → high_price)
+      high: raw.highPrice,
+      // Tiger: "lowPrice" (camelCase → low_price)
+      low: raw.lowPrice,
+      // Tiger: "timestamp" (SPECIAL MAPPING → latest_time)
+      timestamp: raw.timestamp ? new Date(raw.timestamp) : new Date(),
     }
   }
 
@@ -488,6 +542,7 @@ export class TigerBroker implements IBroker {
    *
    * Queries Tiger's `market_state` endpoint for both US and HK markets.
    * Returns `isOpen: true` if either market is currently in a trading session.
+   * Tiger response fields use camelCase: tradingStatus, openTime.
    */
   async getMarketClock(): Promise<MarketClock> {
     const results = await Promise.allSettled([
@@ -500,12 +555,15 @@ export class TigerBroker implements IBroker {
       .flatMap(r => r.value)
 
     const isOpen = statuses.some(s =>
-      s.trading_status === 'Trading' || s.status === 'Trading',
+      // Tiger uses "tradingStatus" (camelCase) in market_state response
+      s.tradingStatus === 'Trading' || s.status === 'Trading',
     )
 
+    const now = Date.now()
+    // Tiger uses "openTime" (camelCase) in market_state response
     const nextOpen = statuses
-      .map(s => s.open_time)
-      .filter((t): t is number => t != null && t > Date.now())
+      .map(s => s.openTime)
+      .filter((t): t is number => t != null && t > now)
       .sort()[0]
 
     return {
@@ -520,8 +578,7 @@ export class TigerBroker implements IBroker {
       market,
       lang: 'en_US',
     })
-    const items = Array.isArray(data) ? data : data ? [data] : []
-    return items as TigerMarketStatusRaw[]
+    return extractItems<TigerMarketStatusRaw>(data)
   }
 
   // ==================== Capabilities ====================
