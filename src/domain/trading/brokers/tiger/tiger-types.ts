@@ -196,9 +196,21 @@ export interface TigerQuoteBriefRaw {
   change?: number
 }
 
+/**
+ * Tiger market_state raw shape — fields from market_status_response.py.
+ * Data structure: data = direct list (not wrapped in items[]).
+ *
+ * JSON field mapping (from market_status_response.py parse logic):
+ *   "market"       → market identifier ("US", "HK", "CN")
+ *   "status"       → trading_status ENUM ("TRADING", "NOT_YET_OPEN", "CLOSED", "NOON_BREAK")
+ *   "marketStatus" → human-readable label ("Trading", "Not Yet Opened", etc.)
+ *   "openTime"     → next open time as string, e.g. "2025-08-12 09:30 EDT"
+ *
+ * IMPORTANT: Check "status" (the enum) for isOpen, NOT "marketStatus" (the label).
+ */
 export interface TigerMarketStatusRaw {
   market?: string
-  status?: string
-  tradingStatus?: string   // camelCase
-  openTime?: number        // camelCase
+  status?: string        // ENUM: "TRADING" | "NOT_YET_OPEN" | "CLOSED" | "NOON_BREAK" | ...
+  marketStatus?: string  // Human-readable label: "Trading", "Not Yet Opened", etc.
+  openTime?: string      // Next open time as string, e.g. "2025-08-12 09:30 EDT"
 }

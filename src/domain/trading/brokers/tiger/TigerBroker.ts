@@ -544,7 +544,8 @@ export class TigerBroker implements IBroker {
    *
    * Queries Tiger's `market_state` endpoint for both US and HK markets.
    * Returns `isOpen: true` if either market is currently in a trading session.
-   * Tiger response fields use camelCase: tradingStatus, openTime.
+   * Tiger response: data = direct list (not items[]).
+   * Key fields: "status" = ENUM ("TRADING"/"NOT_YET_OPEN"/...), "openTime" = string datetime.
    */
   async getMarketClock(): Promise<MarketClock> {
     const results = await Promise.allSettled([
@@ -556,21 +557,19 @@ export class TigerBroker implements IBroker {
       .filter((r): r is PromiseFulfilledResult<TigerMarketStatusRaw[]> => r.status === 'fulfilled')
       .flatMap(r => r.value)
 
-    const isOpen = statuses.some(s =>
-      // Tiger uses "tradingStatus" (camelCase) in market_state response
-      s.tradingStatus === 'Trading' || s.status === 'Trading',
-    )
+    // Tiger "status" field contains the trading enum: "TRADING", "NOT_YET_OPEN", "CLOSED", etc.
+    // (NOT "marketStatus" which is the human-readable label like "Trading")
+    const isOpen = statuses.some(s => s.status === 'TRADING')
 
-    const now = Date.now()
-    // Tiger uses "openTime" (camelCase) in market_state response
+    // "openTime" is a string like "2025-08-12 09:30 EDT", parse it to a Date
     const nextOpen = statuses
-      .map(s => s.openTime)
-      .filter((t): t is number => t != null && t > now)
-      .sort()[0]
+      .map(s => s.openTime ? new Date(s.openTime) : null)
+      .filter((d): d is Date => d != null && !isNaN(d.getTime()) && d.getTime() > Date.now())
+      .sort((a, b) => a.getTime() - b.getTime())[0]
 
     return {
       isOpen,
-      nextOpen: nextOpen ? new Date(nextOpen) : undefined,
+      nextOpen: nextOpen ?? undefined,
       timestamp: new Date(),
     }
   }
