@@ -14,7 +14,7 @@ export const eiaProvider = new Provider({
   description:
     'The U.S. Energy Information Administration (EIA) collects, analyzes, and ' +
     'disseminates independent and impartial energy information.',
-  credentials: ['eia_api_key'],
+  credentials: ['api_key'],
   fetcherDict: {
     PetroleumStatusReport: EIAPetroleumStatusReportFetcher,
     ShortTermEnergyOutlook: EIAShortTermEnergyOutlookFetcher,

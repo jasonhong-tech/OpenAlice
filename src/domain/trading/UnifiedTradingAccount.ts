@@ -53,6 +53,13 @@ function toIbkrTif(tif: string): string {
 
 // ==================== Options ====================
 
+export interface PendingApprovalInfo {
+  accountId: string
+  hash: string
+  message: string
+  operations: Operation[]
+}
+
 export interface UnifiedTradingAccountOptions {
   guards?: Array<{ type: string; options?: Record<string, unknown> }>
   savedState?: GitExportState
@@ -60,6 +67,7 @@ export interface UnifiedTradingAccountOptions {
   onHealthChange?: (accountId: string, health: BrokerHealthInfo) => void
   onPostPush?: (accountId: string) => void | Promise<void>
   onPostReject?: (accountId: string) => void | Promise<void>
+  onPendingApproval?: (info: PendingApprovalInfo) => void
 }
 
 // ==================== Stage param types ====================
@@ -112,6 +120,7 @@ export class UnifiedTradingAccount {
   private readonly _onHealthChange?: (accountId: string, health: BrokerHealthInfo) => void
   private readonly _onPostPush?: (accountId: string) => void | Promise<void>
   private readonly _onPostReject?: (accountId: string) => void | Promise<void>
+  private readonly _onPendingApproval?: (info: PendingApprovalInfo) => void
 
   // ---- Health tracking ----
   private static readonly DEGRADED_THRESHOLD = 3
@@ -135,6 +144,7 @@ export class UnifiedTradingAccount {
     this._onHealthChange = options.onHealthChange
     this._onPostPush = options.onPostPush
     this._onPostReject = options.onPostReject
+    this._onPendingApproval = options.onPendingApproval
 
     // Wire internals
     this._getState = async (): Promise<GitState> => {
@@ -421,7 +431,11 @@ export class UnifiedTradingAccount {
   // ==================== Git flow ====================
 
   commit(message: string): CommitPrepareResult {
-    return this.git.commit(message)
+    const result = this.git.commit(message)
+    // Staged ops remain accessible until push/reject — pass them to the approval handler
+    const operations = this.git.status().staged
+    this._onPendingApproval?.({ accountId: this.id, hash: result.hash, message, operations })
+    return result
   }
 
   async push(): Promise<PushResult> {

@@ -10,7 +10,7 @@ import type { AccountCapabilities, BrokerHealth, BrokerHealthInfo } from './brok
 import { CcxtBroker } from './brokers/ccxt/CcxtBroker.js'
 import { createCcxtProviderTools } from './brokers/ccxt/ccxt-tools.js'
 import { createBroker } from './brokers/factory.js'
-import { UnifiedTradingAccount } from './UnifiedTradingAccount.js'
+import { UnifiedTradingAccount, type PendingApprovalInfo } from './UnifiedTradingAccount.js'
 import { loadGitState, createGitPersister } from './git-persistence.js'
 import { readAccountsConfig, type AccountConfig } from '../../core/config.js'
 import type { EventLog } from '../../core/event-log.js'
@@ -56,6 +56,7 @@ export interface ContractSearchResult {
 export interface SnapshotHooks {
   onPostPush?: (accountId: string) => void | Promise<void>
   onPostReject?: (accountId: string) => void | Promise<void>
+  onPendingApproval?: (info: PendingApprovalInfo) => void
 }
 
 export class AccountManager {
@@ -71,8 +72,10 @@ export class AccountManager {
     this.toolCenter = deps?.toolCenter
   }
 
-  setSnapshotHooks(hooks: SnapshotHooks): void {
-    this._snapshotHooks = hooks
+  /** Merge hooks rather than replace, so multiple callers (snapshot service, Telegram, etc.)
+   *  can each register their own handlers without clobbering one another. */
+  setSnapshotHooks(hooks: Partial<SnapshotHooks>): void {
+    this._snapshotHooks = { ...this._snapshotHooks, ...hooks }
   }
 
   // ==================== Lifecycle ====================
@@ -88,8 +91,11 @@ export class AccountManager {
       onHealthChange: (accountId, health) => {
         this.eventLog?.append('account.health', { accountId, ...health })
       },
-      onPostPush: this._snapshotHooks?.onPostPush,
-      onPostReject: this._snapshotHooks?.onPostReject,
+      // Use indirect closures so hooks registered after initAccount() (e.g. from
+      // TelegramPlugin.start()) still take effect for already-created UTAs.
+      onPostPush: (accountId) => this._snapshotHooks?.onPostPush?.(accountId),
+      onPostReject: (accountId) => this._snapshotHooks?.onPostReject?.(accountId),
+      onPendingApproval: (info) => this._snapshotHooks?.onPendingApproval?.(info),
     })
     this.add(uta)
     return uta

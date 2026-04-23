@@ -51,7 +51,8 @@ export class EIAShortTermEnergyOutlookFetcher extends Fetcher {
       frequency: 'monthly',
       'data[0]': 'value',
       'facets[seriesId][]': catInfo.series,
-      sort: JSON.stringify([{ column: 'period', direction: 'desc' }]),
+      'sort[0][column]': 'period',
+      'sort[0][direction]': 'desc',
       length: '120', // ~10 years of monthly data
     })
 
