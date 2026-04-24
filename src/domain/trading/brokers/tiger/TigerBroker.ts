@@ -441,23 +441,64 @@ export class TigerBroker implements IBroker {
   }
 
   /**
-   * Get orders by IDs. Fetches each order individually since Tiger lacks bulk lookups.
+   * Get orders by IDs.
+   *
+   * Tiger quirk: the `orders` endpoint with `id` is unreliable for conditional
+   * orders (STP / STP_LMT / TRAIL) — stop orders often come back empty. The
+   * `active_orders` endpoint, however, reliably returns all currently pending
+   * orders regardless of type, so we fetch once and filter by the requested IDs.
+   * Any ID not found there (already filled/cancelled) falls back to a per-id
+   * `orders` lookup.
    */
   async getOrders(orderIds: string[]): Promise<OpenOrder[]> {
-    const results: OpenOrder[] = []
+    if (orderIds.length === 0) return []
+
+    const idSet = new Set(orderIds)
+    let actives: TigerOrderRaw[] = []
+    try {
+      actives = await this.fetchActiveOrders()
+    } catch {
+      // Network/API failure — fall through to per-id loop below
+    }
+
+    const matched = actives.filter(r => r.id != null && idSet.has(String(r.id)))
+    const found = new Set(matched.map(r => String(r.id)))
+    const results: OpenOrder[] = matched.map(tigerOrderToOpenOrder)
+
     for (const id of orderIds) {
-      const order = await this.getOrder(id)
+      if (found.has(id)) continue
+      const order = await this.fetchOrderByOrdersEndpoint(id)
       if (order) results.push(order)
     }
+
     return results
   }
 
   /**
    * Get a single order by global ID.
-   * Tiger's `orders` endpoint accepts `id` (global int64) or `order_id` (account-level).
-   * Response may be { items: [...] } for multiple orders, or a flat object for a single order.
+   *
+   * Tries the `orders` endpoint first (covers filled/cancelled + plain LMT),
+   * then falls back to `active_orders` for pending STP / STP_LMT / TRAIL orders
+   * that the `orders` endpoint doesn't return.
    */
   async getOrder(orderId: string): Promise<OpenOrder | null> {
+    const viaOrders = await this.fetchOrderByOrdersEndpoint(orderId)
+    if (viaOrders) return viaOrders
+
+    try {
+      const actives = await this.fetchActiveOrders()
+      const raw = actives.find(r => r.id != null && String(r.id) === orderId)
+      return raw ? tigerOrderToOpenOrder(raw) : null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Query the `orders` endpoint with a specific `id`.
+   * Handles Tiger's multiple response shapes: { items: [...] }, array, or flat object.
+   */
+  private async fetchOrderByOrdersEndpoint(orderId: string): Promise<OpenOrder | null> {
     try {
       const data = await this.client.execute('orders', {
         account: this.account,
@@ -469,19 +510,16 @@ export class TigerBroker implements IBroker {
 
       const dataObj = data as Record<string, unknown>
 
-      // Handle { items: [...] } structure
       if (Array.isArray(dataObj.items)) {
         const raw = (dataObj.items as TigerOrderRaw[])[0]
         return raw ? tigerOrderToOpenOrder(raw) : null
       }
 
-      // Handle direct list
       if (Array.isArray(data)) {
         const raw = (data as TigerOrderRaw[])[0]
         return raw ? tigerOrderToOpenOrder(raw) : null
       }
 
-      // Handle single flat order object (Tiger returns this when querying by id)
       if (dataObj.symbol || dataObj.id) {
         return tigerOrderToOpenOrder(dataObj as TigerOrderRaw)
       }
@@ -490,6 +528,20 @@ export class TigerBroker implements IBroker {
     } catch {
       return null
     }
+  }
+
+  /**
+   * Fetch all currently pending orders via the `active_orders` endpoint.
+   * Unlike `orders`, this reliably includes STP / STP_LMT / TRAIL orders.
+   * Response shape matches TigerOrderRaw (same schema as the `orders` endpoint).
+   */
+  private async fetchActiveOrders(): Promise<TigerOrderRaw[]> {
+    const data = await this.client.execute('active_orders', {
+      account: this.account,
+      market: 'ALL',
+      lang: 'en_US',
+    })
+    return extractItems<TigerOrderRaw>(data)
   }
 
   /**
