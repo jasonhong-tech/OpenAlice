@@ -21,7 +21,7 @@ export type PetroleumStatusReportQueryParams = z.infer<typeof PetroleumStatusRep
 
 export const PetroleumStatusReportDataSchema = z.object({
   date: z.string().describe('Observation date.'),
-  value: z.number().nullable().default(null).describe('Observation value.'),
+  value: z.coerce.number().nullable().default(null).describe('Observation value.'),
   category: z.string().nullable().default(null).describe('Data category.'),
   unit: z.string().nullable().default(null).describe('Unit of measurement.'),
 }).passthrough()

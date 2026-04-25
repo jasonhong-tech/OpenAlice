@@ -13,6 +13,9 @@ import { forceCompact } from '../../core/compaction'
 import { readAIBackend, writeAIBackend, type AIBackend } from '../../core/config'
 import type { ConnectorCenter } from '../../core/connector-center.js'
 import { TelegramConnector, splitMessage, MAX_MESSAGE_LENGTH } from './telegram-connector.js'
+import type { AccountManager } from '../../domain/trading/account-manager.js'
+import type { PendingApprovalInfo } from '../../domain/trading/UnifiedTradingAccount.js'
+import type { Operation, PushResult, RejectResult } from '../../domain/trading/git/types.js'
 
 const BACKEND_LABELS: Record<AIBackend, string> = {
   'claude-code': 'Claude Code',
@@ -35,6 +38,12 @@ export class TelegramPlugin implements Plugin {
   /** Throttle: last time we sent an auth-guidance reply per chatId. */
   private authReplyThrottle = new Map<number, number>()
 
+  /** AccountManager ref — populated in start(), used for approval callbacks. */
+  private accountManager: AccountManager | null = null
+
+  /** Tracks in-flight approval messages. key: "${accountId}:${hash}" → {chatId, messageId} */
+  private pendingMessages = new Map<string, { chatId: number; messageId: number }>()
+
   constructor(
     config: Omit<TelegramConfig, 'pollingTimeout'> & { pollingTimeout?: number },
     agentSdkConfig: AgentSdkConfig = {},
@@ -45,6 +54,16 @@ export class TelegramPlugin implements Plugin {
 
   async start(engineCtx: EngineContext) {
     this.connectorCenter = engineCtx.connectorCenter
+
+    // Register trade approval + post-push/reject hooks so we can track and clean up messages
+    if (engineCtx.accountManager) {
+      this.accountManager = engineCtx.accountManager
+      engineCtx.accountManager.setSnapshotHooks({
+        onPendingApproval: (info) => this.sendApprovalRequest(info),
+        onPostPush: (accountId) => this.closePendingMessage(accountId, 'approved'),
+        onPostReject: (accountId) => this.closePendingMessage(accountId, 'rejected'),
+      })
+    }
 
     // Inject agent config into Claude Code config (used by /compact command)
     this.agentSdkConfig = {
@@ -135,6 +154,42 @@ export class TelegramPlugin implements Plugin {
             `Heartbeat: ${newEnabled ? 'ON' : 'OFF'}\n\nToggle heartbeat self-check:`,
             { reply_markup: keyboard },
           )
+        } else if (data.startsWith('trade_approve:')) {
+          const [, accountId, hash] = data.split(':')
+          await ctx.answerCallbackQuery()
+          const uta = this.accountManager?.get(accountId)
+          const currentStatus = uta?.status()
+          if (!uta || currentStatus?.pendingHash !== hash) {
+            await ctx.editMessageText('⚠️ This approval request has expired or was already handled.').catch(() => {})
+            this.pendingMessages.delete(`${accountId}:${hash}`)
+            return
+          }
+          try {
+            const result = await uta.push()
+            await ctx.editMessageText(this.formatPushResult(result)).catch(() => {})
+          } catch (err) {
+            await ctx.editMessageText(`❌ Push failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => {})
+          }
+          this.pendingMessages.delete(`${accountId}:${hash}`)
+
+        } else if (data.startsWith('trade_reject:')) {
+          const [, accountId, hash] = data.split(':')
+          await ctx.answerCallbackQuery()
+          const uta = this.accountManager?.get(accountId)
+          const currentStatus = uta?.status()
+          if (!uta || currentStatus?.pendingHash !== hash) {
+            await ctx.editMessageText('⚠️ This approval request has expired or was already handled.').catch(() => {})
+            this.pendingMessages.delete(`${accountId}:${hash}`)
+            return
+          }
+          try {
+            const result = await uta.reject()
+            await ctx.editMessageText(this.formatRejectResult(result)).catch(() => {})
+          } catch (err) {
+            await ctx.editMessageText(`❌ Reject failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => {})
+          }
+          this.pendingMessages.delete(`${accountId}:${hash}`)
+
         } else {
           await ctx.answerCallbackQuery()
         }
@@ -400,6 +455,107 @@ export class TelegramPlugin implements Plugin {
       for (const chunk of chunks) {
         await this.bot!.api.sendMessage(chatId, chunk)
       }
+    }
+  }
+
+  // ── Trade approval ──
+
+  /** Called by AccountManager hook when a trade is committed and awaiting approval. */
+  private sendApprovalRequest(info: PendingApprovalInfo): void {
+    const deliveryChatId = this.config.allowedChatIds[0]
+    if (!deliveryChatId || !this.bot) return
+
+    const text = this.formatApprovalMessage(info)
+    const keyboard = new InlineKeyboard()
+      .text('✅ Approve', `trade_approve:${info.accountId}:${info.hash}`)
+      .text('❌ Reject', `trade_reject:${info.accountId}:${info.hash}`)
+
+    this.bot.api.sendMessage(deliveryChatId, text, { reply_markup: keyboard })
+      .then((msg) => {
+        this.pendingMessages.set(`${info.accountId}:${info.hash}`, {
+          chatId: deliveryChatId,
+          messageId: msg.message_id,
+        })
+      })
+      .catch((err) => {
+        console.error('telegram: failed to send approval request:', err)
+      })
+  }
+
+  private formatApprovalMessage(info: PendingApprovalInfo): string {
+    const lines: string[] = [
+      `⏳ Approval Required — ${info.accountId}`,
+      `#${info.hash} · ${info.message}`,
+      '',
+    ]
+    for (const op of info.operations) {
+      lines.push(this.formatOperation(op))
+    }
+    return lines.join('\n')
+  }
+
+  private formatOperation(op: Operation): string {
+    switch (op.action) {
+      case 'placeOrder': {
+        const sym = op.contract.symbol || op.contract.aliceId || '?'
+        const side = op.order.action ?? '?'
+        const qty = op.order.totalQuantity?.toFixed(0) ?? '?'
+        const orderType = op.order.orderType ?? 'MKT'
+        const lmtPrice = op.order.lmtPrice != null ? ` @ ${op.order.lmtPrice.toFixed(2)}` : ''
+        return `• ${side} ${qty} ${sym}  ${orderType}${lmtPrice}`
+      }
+      case 'closePosition': {
+        const sym = op.contract.symbol || op.contract.aliceId || '?'
+        const qty = op.quantity?.toFixed(0) ?? 'all'
+        return `• CLOSE ${qty} ${sym}`
+      }
+      case 'modifyOrder':
+        return `• MODIFY order ${op.orderId}`
+      case 'cancelOrder':
+        return `• CANCEL order ${op.orderId}`
+      case 'syncOrders':
+        return `• SYNC orders`
+    }
+  }
+
+  private formatPushResult(result: PushResult): string {
+    const lines: string[] = [
+      `✅ Approved — #${result.hash}`,
+      result.message,
+      '',
+    ]
+    if (result.submitted.length > 0) {
+      lines.push(`Submitted: ${result.submitted.length}`)
+      for (const r of result.submitted) {
+        lines.push(`  • ${r.action}${r.orderId ? ` (${r.orderId})` : ''} — ${r.status}`)
+      }
+    }
+    if (result.rejected.length > 0) {
+      lines.push(`Rejected: ${result.rejected.length}`)
+      for (const r of result.rejected) {
+        lines.push(`  • ${r.action} — ${r.error ?? r.status}`)
+      }
+    }
+    return lines.join('\n')
+  }
+
+  private formatRejectResult(result: RejectResult): string {
+    return `❌ Rejected — #${result.hash}\n${result.message}`
+  }
+
+  /**
+   * Called via onPostPush/onPostReject hooks when an approval is handled outside Telegram
+   * (e.g. via Web UI). Edits the matching Telegram message to remove the stale buttons.
+   */
+  private closePendingMessage(accountId: string, outcome: 'approved' | 'rejected'): void {
+    for (const [key, { chatId, messageId }] of this.pendingMessages) {
+      if (!key.startsWith(`${accountId}:`)) continue
+      const text = outcome === 'approved'
+        ? '✅ Approved via Web UI'
+        : '❌ Rejected via Web UI'
+      this.bot?.api.editMessageText(chatId, messageId, text).catch(() => {})
+      this.pendingMessages.delete(key)
+      break
     }
   }
 }

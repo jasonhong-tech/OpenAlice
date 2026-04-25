@@ -343,7 +343,7 @@ NOTE: This stages the operation. Call tradingCommit + tradingPush to execute.`,
     }),
 
     tradingPush: tool({
-      description: 'Trading push requires manual approval — call tradingStatus to show the user what is pending, then tell them to approve in the UI.',
+      description: 'Trading push requires manual approval — call tradingStatus to show the user what is pending, then tell them to approve via Telegram (preferred) or the Web UI. Do NOT attempt to execute the push yourself.',
       inputSchema: z.object({
         source: z.string().optional().describe(sourceDesc(false, 'If omitted, checks all accounts.')),
       }),

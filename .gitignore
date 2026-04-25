@@ -31,3 +31,5 @@ packages/ibkr/ref/source/cppclient/
 packages/ibkr/ref/samples/Java/
 packages/ibkr/ref/samples/Cpp/
 packages/ibkr/ref/CMakeLists.txt
+
+tiger_docs/

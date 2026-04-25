@@ -21,7 +21,7 @@ export type ShortTermEnergyOutlookQueryParams = z.infer<typeof ShortTermEnergyOu
 
 export const ShortTermEnergyOutlookDataSchema = z.object({
   date: z.string().describe('Observation date.'),
-  value: z.number().nullable().default(null).describe('Observation value.'),
+  value: z.coerce.number().nullable().default(null).describe('Observation value.'),
   category: z.string().nullable().default(null).describe('Data category.'),
   unit: z.string().nullable().default(null).describe('Unit of measurement.'),
   forecast: z.boolean().nullable().default(null).describe('Whether this is a forecast value.'),
