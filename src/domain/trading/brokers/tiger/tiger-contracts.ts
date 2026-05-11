@@ -336,8 +336,23 @@ export function tigerPositionToUnified(raw: TigerPositionRaw): Position {
  *
  * Format D — flat single object:
  *   data = { netLiquidation, cashValue, ... }
+ *
+ * The optional `fundHoldingsValue` is the summed market value of FUND-segment
+ * positions (mutual / money-market funds), which the standard `assets` endpoint
+ * does NOT include in its SEC-segment netLiquidation/cashValue. When provided
+ * (>0), it is added to both `totalCashValue` and `netLiquidation` so callers
+ * see fund NAV as part of the account's available capital.
  */
-export function tigerAssetsToAccountInfo(data: unknown): AccountInfo {
+export function tigerAssetsToAccountInfo(data: unknown, fundHoldingsValue = 0): AccountInfo {
+  const info = parseAssetsResponse(data)
+  if (fundHoldingsValue > 0) {
+    info.totalCashValue += fundHoldingsValue
+    info.netLiquidation += fundHoldingsValue
+  }
+  return info
+}
+
+function parseAssetsResponse(data: unknown): AccountInfo {
   if (!data || typeof data !== 'object') {
     return makeZeroAccountInfo()
   }

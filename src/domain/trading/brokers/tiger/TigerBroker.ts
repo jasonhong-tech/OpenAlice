@@ -409,13 +409,143 @@ export class TigerBroker implements IBroker {
    * Uses Tiger's `assets` endpoint.
    * Tiger response: data = { items: [{ netLiquidation, cashValue, buyingPower, ... }] }
    * All fields in the item use camelCase (not snake_case).
+   *
+   * IMPORTANT: Tiger separates SEC-segment (stock/option) and FUND-segment
+   * (mutual / money-market fund) holdings. The standard `assets` endpoint
+   * returns SEC-segment data only — FUND positions are NOT included in
+   * `cashValue` / `netLiquidation`. To give the agent a single "available
+   * capital" figure that treats fund NAV as cash-equivalent (which is
+   * especially important for money-market funds), we fetch FUND positions
+   * via `positions` (sec_type=FUND) in parallel and add their summed
+   * marketValue (份额 × 净值) into both totalCashValue and netLiquidation.
+   *
+   * Fund-position fetch failures are non-fatal: the assets call must succeed
+   * but a fund-side error degrades to fundHoldingsValue=0 rather than
+   * throwing.
    */
   async getAccount(): Promise<AccountInfo> {
-    const data = await this.client.execute('assets', {
-      account: this.account,
-      lang: 'en_US',
-    })
-    return tigerAssetsToAccountInfo(data)
+    const [data, fundHoldingsValue] = await Promise.all([
+      this.client.execute('assets', {
+        account: this.account,
+        lang: 'en_US',
+      }),
+      this.fetchFundHoldingsValue(),
+    ])
+    return tigerAssetsToAccountInfo(data, fundHoldingsValue)
+  }
+
+  /**
+   * Sum the USD-equivalent market value (份额 × 最新净值) of all FUND-segment
+   * holdings.
+   *
+   * Calls `positions` with sec_type=FUND (per Tiger SDK SecurityType.FUND),
+   * groups holdings by quote currency, and converts every non-USD bucket via
+   * Tiger's `financial_exchange_rate` endpoint before summing — so an HKD or
+   * SGD money-market fund contributes its true USD value rather than its raw
+   * local-currency face amount.
+   *
+   * Returns 0 on any failure — fund-side errors must not break getAccount().
+   * If the FX call fails, USD-denominated fund holdings are still counted;
+   * other currencies degrade silently to 0 rather than being summed at face
+   * value (which would have been wrong cross-currency).
+   */
+  private async fetchFundHoldingsValue(): Promise<number> {
+    try {
+      const data = await this.client.execute('positions', {
+        account: this.account,
+        sec_type: 'FUND',
+        currency: 'ALL',
+        market: 'ALL',
+        lang: 'en_US',
+      })
+
+      // Bucket positions by currency. Tiger's `currency` field on each fund
+      // position is the fund's quote currency (USD/HKD/SGD/CNH/...).
+      const byCurrency: Record<string, number> = {}
+      for (const p of extractItems<TigerPositionRaw>(data)) {
+        if ((p.position ?? 0) === 0) continue
+        const mv = p.marketValue
+        if (typeof mv !== 'number' || !isFinite(mv)) continue
+        const currency = (p.currency ?? 'USD').toUpperCase()
+        byCurrency[currency] = (byCurrency[currency] ?? 0) + Math.abs(mv)
+      }
+
+      const usdAmount = byCurrency.USD ?? 0
+      const foreignCurrencies = Object.keys(byCurrency).filter(c => c !== 'USD')
+      if (foreignCurrencies.length === 0) return usdAmount
+
+      // Pull "1 USD = X units of <currency>" rates for every non-USD bucket.
+      const rates = await this.fetchUsdFxRates(foreignCurrencies)
+
+      let total = usdAmount
+      for (const currency of foreignCurrencies) {
+        const amount = byCurrency[currency]
+        const rate = rates[currency]
+        if (rate && rate > 0 && isFinite(rate)) {
+          // rate = local units per 1 USD → convert local→USD by dividing.
+          total += amount / rate
+        }
+        // Missing/zero rate: skip rather than face-sum across currencies.
+      }
+      return total
+    } catch {
+      return 0
+    }
+  }
+
+  /**
+   * Fetch "1 USD = X units" exchange rates from Tiger's
+   * `financial_exchange_rate` endpoint.
+   *
+   * Response shape (per FinancialExchangeRateResponse parser):
+   *   data = [
+   *     { currency: "HKD", dailyValueList: [{ date: <ms>, value: 7.81728 }, ...] },
+   *     { currency: "SGD", dailyValueList: [{ date: <ms>, value: 1.3xxxx }, ...] },
+   *   ]
+   * We pick the most recent dailyValueList entry per currency. The endpoint
+   * may return USD with value=1.0 even if not requested.
+   *
+   * Window: yesterday → today, so weekend/holiday queries (when today's rate
+   * isn't yet published) still get a usable previous-business-day rate.
+   * Returns {} on any failure — caller treats missing rate as "skip this
+   * currency".
+   */
+  private async fetchUsdFxRates(currencies: string[]): Promise<Record<string, number>> {
+    if (currencies.length === 0) return {}
+    try {
+      const now = Date.now()
+      const beginMs = now - 7 * 24 * 60 * 60 * 1000 // 7d window covers long holidays
+      const data = await this.client.execute('financial_exchange_rate', {
+        currency_list: currencies,
+        begin_date: beginMs,
+        end_date: now,
+        lang: 'en_US',
+      })
+
+      const items: unknown[] = Array.isArray(data) ? data : extractItems<unknown>(data)
+      const rates: Record<string, number> = {}
+      for (const item of items) {
+        const obj = item as Record<string, unknown>
+        const currency = String(obj.currency ?? '').toUpperCase()
+        if (!currency) continue
+        const list = Array.isArray(obj.dailyValueList) ? obj.dailyValueList : []
+        let latestDate = -Infinity
+        let latestValue = 0
+        for (const e of list) {
+          const eObj = e as Record<string, unknown>
+          const date = typeof eObj.date === 'number' ? eObj.date : 0
+          const value = typeof eObj.value === 'number' ? eObj.value : 0
+          if (value > 0 && date >= latestDate) {
+            latestDate = date
+            latestValue = value
+          }
+        }
+        if (latestValue > 0) rates[currency] = latestValue
+      }
+      return rates
+    } catch {
+      return {}
+    }
   }
 
   /**
@@ -424,6 +554,11 @@ export class TigerBroker implements IBroker {
    * Tiger response: data = { items: [TigerPositionRaw, ...] }
    * Contract fields (symbol, currency, secType) are FLAT on each position item.
    * Position quantity uses field name "position" (not "quantity").
+   *
+   * Only returns SEC-segment (stock/option/etc.) positions. Fund positions
+   * are intentionally excluded here — their NAV is rolled into the cash
+   * figure via getAccount() instead, so the unified Position list stays
+   * focused on tradable equity-like instruments.
    */
   async getPositions(): Promise<Position[]> {
     const data = await this.client.execute('positions', {
