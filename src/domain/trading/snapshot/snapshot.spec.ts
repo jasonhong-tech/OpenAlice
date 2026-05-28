@@ -44,7 +44,7 @@ function makeSubmittedOrder(symbol = 'AAPL'): ReturnType<typeof makeOpenOrder> {
   order.lmtPrice = 150
   const orderState = new OrderState()
   orderState.status = 'Submitted'
-  return { contract, order, orderState }
+  return { orderId: '42', contract, order, orderState }
 }
 
 function makeFilledOrder(symbol = 'AAPL'): ReturnType<typeof makeOpenOrder> {

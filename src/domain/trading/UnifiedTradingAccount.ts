@@ -493,6 +493,13 @@ export class UnifiedTradingAccount {
           ? orderFilledQty.toNumber()
           : undefined
 
+        // Preserve the broker's reason string for terminal-rejected / cancelled
+        // orders (Tiger surfaces these in `remark`, mapped to `rejectReason` by
+        // the TigerBroker adapter). Without this, the AI just sees "rejected"
+        // with no explanation.
+        const rejectReason =
+          brokerOrder.orderState.rejectReason || brokerOrder.orderState.warningText || undefined
+
         updates.push({
           orderId,
           symbol,
@@ -500,6 +507,7 @@ export class UnifiedTradingAccount {
           currentStatus: status === 'Filled' ? 'filled' : status === 'Cancelled' ? 'cancelled' : 'rejected',
           filledQty,
           filledPrice: brokerOrder.avgFillPrice,
+          rejectReason,
         })
       }
     }
@@ -538,6 +546,20 @@ export class UnifiedTradingAccount {
 
   async getOrders(orderIds: string[]): Promise<OpenOrder[]> {
     const orders = await this._callBroker(() => this.broker.getOrders(orderIds))
+    for (const o of orders) this.stampAliceId(o.contract)
+    return orders
+  }
+
+  /**
+   * Return EVERY currently-open order on the broker side — including orphan
+   * orders not tracked in our git history. Falls back to an empty array for
+   * brokers that don't implement `listOpenOrders`. Designed to surface
+   * stale GTC orders that may still be reserving inventory and silently
+   * causing fresh placements to be rejected.
+   */
+  async listOpenOrders(): Promise<OpenOrder[]> {
+    if (typeof this.broker.listOpenOrders !== 'function') return []
+    const orders = await this._callBroker(() => this.broker.listOpenOrders!())
     for (const o of orders) this.stampAliceId(o.contract)
     return orders
   }

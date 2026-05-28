@@ -7,7 +7,8 @@
  * Key differences from IBKR/Alpaca:
  * - REST API (not persistent socket) — init() just validates credentials
  * - Auth: RSA private key signs every request (no session/token needed)
- * - Order IDs: Tiger returns large int64 global IDs; we use those as string orderIds
+ * - Order IDs: Tiger returns large int64 global IDs; keep them as decimal strings
+ *   because JavaScript numbers cannot represent them exactly
  * - HK stocks: symbol format "00700", exchange "SEHK", currency HKD
  * - Order ID pre-allocation: place_order requires a pre-fetched order_id from order_no
  *
@@ -41,6 +42,8 @@ import {
   tigerAssetsToAccountInfo,
   tigerStatusToOrderState,
   ibkrOrderTypeToTiger,
+  tigerIdMatchesRequested,
+  tigerIdToString,
   buildNativeKey,
   resolveNativeKey as resolveNativeKeyHelper,
 } from './tiger-contracts.js'
@@ -51,6 +54,7 @@ import type {
   TigerContractRaw,
   TigerQuoteBriefRaw,
   TigerMarketStatusRaw,
+  TigerInt,
   TigerOrderIdData,
 } from './tiger-types.js'
 
@@ -65,6 +69,29 @@ function extractItems<T>(data: unknown): T[] {
   if (obj && Array.isArray(obj.items)) return obj.items as T[]
   return []
 }
+
+function isOrderDoesNotExistError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return /order does not exist/i.test(message)
+}
+
+function findMatchingRequestedOrderId(rawId: TigerInt | null | undefined, requestedIds: Set<string>): string | null {
+  for (const requestedId of requestedIds) {
+    if (tigerIdMatchesRequested(rawId, requestedId)) return requestedId
+  }
+  return null
+}
+
+/**
+ * Lookback window (ms) for `active_orders` / `inactive_orders` queries.
+ *
+ * Tiger's order-listing endpoints silently default to a short server-side
+ * window (~24h) when `start_date` is omitted, which hides long-lived GTC
+ * stop orders from `getOrders`. We pass an explicit 365-day window so any
+ * still-active GTC stop placed within the past year is discoverable —
+ * mirrors what Tiger's own SDK example (`examples/nasdaq100.py`) does.
+ */
+const ORDER_LOOKBACK_MS = 365 * 24 * 60 * 60 * 1000
 
 export class TigerBroker implements IBroker {
   // ---- Self-registration ----
@@ -146,6 +173,17 @@ export class TigerBroker implements IBroker {
   private readonly account: string
   private readonly client: TigerClient
   private initialized = false
+  /**
+   * Per-process dedup set for `fetchInactiveOrders` diagnostic logging.
+   * Tiger keeps rejected orders in `inactive_orders` for up to a year, so
+   * a 365-day lookback keeps returning the SAME historical rejects on every
+   * call. Without dedup the log gets spammed with dozens of identical lines
+   * every time `getOrders` falls back to bucket 3 (which happens on every
+   * sync that has any missing id). We log each (id, status) pair at most
+   * once per broker-instance lifetime so the AI / operator sees fresh
+   * rejections clearly but doesn't drown in replays.
+   */
+  private readonly loggedRejectedOrderIds = new Set<string>()
 
   constructor(config: TigerBrokerConfig) {
     this.id = config.id ?? 'tiger'
@@ -250,7 +288,7 @@ export class TigerBroker implements IBroker {
    * Tiger flow:
    *   1. Fetch a fresh order_id via `order_no` endpoint
    *   2. Submit order via `place_order` endpoint
-   *   3. Return the global `id` (int64) as the canonical orderId
+   *   3. Return the global `id` (int64 decimal string) as the canonical orderId
    */
   async placeOrder(contract: Contract, order: Order): Promise<PlaceOrderResult> {
     try {
@@ -294,7 +332,7 @@ export class TigerBroker implements IBroker {
 
       const placeData = await this.client.execute('place_order', bizContent) as TigerOrderIdData | null
 
-      const globalId = placeData?.id
+      const globalId = tigerIdToString(placeData?.id)
       if (!globalId) {
         return { success: false, error: 'Tiger did not return a global order ID' }
       }
@@ -304,10 +342,20 @@ export class TigerBroker implements IBroker {
 
       return {
         success: true,
-        orderId: String(globalId),
+        orderId: globalId,
         orderState: os,
       }
     } catch (err) {
+      this.logTigerError('placeOrder', err, {
+        symbol: contract.symbol,
+        secType: contract.secType,
+        action: order.action,
+        orderType: order.orderType,
+        tif: order.tif,
+        qty: order.totalQuantity?.toNumber(),
+        lmtPrice: order.lmtPrice,
+        auxPrice: order.auxPrice,
+      })
       return { success: false, error: err instanceof Error ? err.message : String(err) }
     }
   }
@@ -324,12 +372,13 @@ export class TigerBroker implements IBroker {
       }
 
       const orig = existing.order
+      const resolvedOrderId = existing.orderId || orderId
       // Contract fields are FLAT (not nested), quantity field is "total_quantity"
       const tigerContractParams = contractToTigerParams(existing.contract)
 
       const bizContent: Record<string, unknown> = {
         account: this.account,
-        id: parseInt(orderId, 10),
+        id: resolvedOrderId,
         ...tigerContractParams,           // symbol, sec_type, currency, market, exchange
         action: orig.action,
         order_type: ibkrOrderTypeToTiger(
@@ -353,31 +402,89 @@ export class TigerBroker implements IBroker {
       os.status = 'Submitted'
       return {
         success: true,
-        orderId,
+        orderId: resolvedOrderId,
         orderState: os,
       }
     } catch (err) {
+      this.logTigerError('modifyOrder', err, {
+        orderId,
+        changes: {
+          orderType: changes.orderType,
+          tif: changes.tif,
+          qty: changes.totalQuantity?.toNumber(),
+          lmtPrice: changes.lmtPrice,
+          auxPrice: changes.auxPrice,
+        },
+      })
       return { success: false, error: err instanceof Error ? err.message : String(err) }
     }
   }
 
   /**
-   * Cancel an order by its global ID.
+   * Cancel an order by its global int64 ID.
    */
   async cancelOrder(orderId: string, _orderCancel?: OrderCancel): Promise<PlaceOrderResult> {
     try {
-      await this.client.execute('cancel_order', {
-        account: this.account,
-        id: parseInt(orderId, 10),
-        lang: 'en_US',
-      })
+      await this.cancelTigerOrder(orderId)
 
       const os = new OrderState()
       os.status = 'Cancelled'
       return { success: true, orderId, orderState: os }
     } catch (err) {
+      if (isOrderDoesNotExistError(err)) {
+        const resolvedOrderId = await this.resolveCanonicalOrderId(orderId)
+        if (resolvedOrderId && resolvedOrderId !== orderId) {
+          try {
+            await this.cancelTigerOrder(resolvedOrderId)
+
+            const os = new OrderState()
+            os.status = 'Cancelled'
+            return { success: true, orderId: resolvedOrderId, orderState: os }
+          } catch (retryErr) {
+            this.logTigerError('cancelOrder', retryErr, { orderId, resolvedOrderId })
+            return { success: false, error: retryErr instanceof Error ? retryErr.message : String(retryErr) }
+          }
+        }
+      }
+
+      this.logTigerError('cancelOrder', err, { orderId })
       return { success: false, error: err instanceof Error ? err.message : String(err) }
     }
+  }
+
+  private async cancelTigerOrder(orderId: string): Promise<void> {
+    await this.client.execute('cancel_order', {
+      account: this.account,
+      id: orderId,
+      lang: 'en_US',
+    })
+  }
+
+  private async resolveCanonicalOrderId(orderId: string): Promise<string | null> {
+    try {
+      const actives = await this.fetchActiveOrders()
+      const raw = actives.find(r => tigerIdMatchesRequested(r.id, orderId))
+      return tigerIdToString(raw?.id) ?? null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Centralised error logging for write-path Tiger API failures.
+   *
+   * Tiger surfaces real rejection reasons (tick-size, permission, TIF
+   * unsupported, insufficient buying power, ...) in the `code` + `message`
+   * pair already wrapped by TigerClient into BrokerError. We log it here so
+   * the server-side logs always show *why* an order operation failed, rather
+   * than just bubbling the message string up to the AI and forgetting it.
+   *
+   * Reads are NOT logged here (they fail commonly and are best-effort).
+   */
+  private logTigerError(operation: string, err: unknown, context?: Record<string, unknown>): void {
+    const message = err instanceof Error ? err.message : String(err)
+    const code = err instanceof BrokerError ? err.code : 'UNKNOWN'
+    console.error(`TigerBroker[${this.id}] ${operation} failed [${code}]: ${message}`, context ?? {})
   }
 
   /**
@@ -576,34 +683,89 @@ export class TigerBroker implements IBroker {
   }
 
   /**
+   * Enumerate every order currently open on Tiger (Submitted / PendingSubmit
+   * / partial-fill state). Critically, this surfaces *orphan* orders — GTC
+   * stops placed days or weeks ago, or via the Tiger app, that aren't in
+   * OpenAlice's git history but are still alive on the exchange and still
+   * holding inventory. Without this, Alice cannot detect why a fresh stop
+   * order gets rejected with "quantity exceeds current holdings".
+   *
+   * The underlying `fetchActiveOrders` already widens the server-side time
+   * window via ORDER_LOOKBACK_MS, so year-old GTC orders are included.
+   */
+  async listOpenOrders(): Promise<OpenOrder[]> {
+    const actives = await this.fetchActiveOrders()
+    return actives.map(r => tigerOrderToOpenOrder(r))
+  }
+
+  /**
    * Get orders by IDs.
    *
-   * Tiger quirk: the `orders` endpoint with `id` is unreliable for conditional
-   * orders (STP / STP_LMT / TRAIL) — stop orders often come back empty. The
-   * `active_orders` endpoint, however, reliably returns all currently pending
-   * orders regardless of type, so we fetch once and filter by the requested IDs.
-   * Any ID not found there (already filled/cancelled) falls back to a per-id
-   * `orders` lookup.
+   * Tiger partitions an order's life cycle across THREE separate endpoints,
+   * and the single-id `orders` endpoint is unreliable for stop-type orders
+   * (STP / STP_LMT / TRAIL — confirmed by Tiger Python SDK behavior). So we
+   * need to consult all three buckets to reliably resolve any given ID:
+   *
+   *   1. `active_orders`   — currently pending (Submitted / PendingSubmit)
+   *   2. `orders` (per id) — filled / cancelled (works for plain LMT/MKT)
+   *   3. `inactive_orders` — REJECTED + CANCELLED (where stop-type rejects
+   *                          actually surface; status = 'Inactive')
+   *
+   * Bucket 3 is the critical fix for "rejected stop orders disappear" —
+   * without it, REJECTED STP orders show up as empty results because they
+   * leave `active_orders` and the per-id `orders` endpoint can't find them.
+   * Tiger SDK's `get_cancelled_orders` maps to this same endpoint.
+   *
+   * Buckets are consulted lazily: bucket 3 only fires if buckets 1 + 2 still
+   * leave IDs unresolved — keeps the happy path at one HTTP call.
    */
   async getOrders(orderIds: string[]): Promise<OpenOrder[]> {
     if (orderIds.length === 0) return []
 
     const idSet = new Set(orderIds)
+    const results: OpenOrder[] = []
+    const found = new Set<string>()
+
+    // Bucket 1: active_orders
     let actives: TigerOrderRaw[] = []
     try {
       actives = await this.fetchActiveOrders()
     } catch {
-      // Network/API failure — fall through to per-id loop below
+      // Network/API failure — fall through to remaining buckets
+    }
+    for (const r of actives) {
+      const requestedId = findMatchingRequestedOrderId(r.id, idSet)
+      if (requestedId) {
+        results.push(tigerOrderToOpenOrder(r))
+        found.add(requestedId)
+      }
     }
 
-    const matched = actives.filter(r => r.id != null && idSet.has(String(r.id)))
-    const found = new Set(matched.map(r => String(r.id)))
-    const results: OpenOrder[] = matched.map(tigerOrderToOpenOrder)
-
+    // Bucket 2: per-id `orders` endpoint (filled / cancelled LMT/MKT path)
     for (const id of orderIds) {
       if (found.has(id)) continue
       const order = await this.fetchOrderByOrdersEndpoint(id)
-      if (order) results.push(order)
+      if (order) {
+        results.push(order)
+        found.add(id)
+      }
+    }
+
+    // Bucket 3: inactive_orders (REJECTED stop-types, last-chance fallback)
+    if (found.size < orderIds.length) {
+      const missing = new Set(orderIds.filter(id => !found.has(id)))
+      try {
+        const inactives = await this.fetchInactiveOrders()
+        for (const r of inactives) {
+          const requestedId = findMatchingRequestedOrderId(r.id, missing)
+          if (requestedId) {
+            results.push(tigerOrderToOpenOrder(r))
+            found.add(requestedId)
+          }
+        }
+      } catch {
+        // Best-effort — caller already gets whatever buckets 1+2 returned.
+      }
     }
 
     return results
@@ -612,9 +774,9 @@ export class TigerBroker implements IBroker {
   /**
    * Get a single order by global ID.
    *
-   * Tries the `orders` endpoint first (covers filled/cancelled + plain LMT),
-   * then falls back to `active_orders` for pending STP / STP_LMT / TRAIL orders
-   * that the `orders` endpoint doesn't return.
+   * Same three-bucket strategy as getOrders, but optimised for a single ID —
+   * `orders` (per-id) → `active_orders` (pending stop-types) →
+   * `inactive_orders` (REJECTED stop-types).
    */
   async getOrder(orderId: string): Promise<OpenOrder | null> {
     const viaOrders = await this.fetchOrderByOrdersEndpoint(orderId)
@@ -622,7 +784,15 @@ export class TigerBroker implements IBroker {
 
     try {
       const actives = await this.fetchActiveOrders()
-      const raw = actives.find(r => r.id != null && String(r.id) === orderId)
+      const raw = actives.find(r => tigerIdMatchesRequested(r.id, orderId))
+      if (raw) return tigerOrderToOpenOrder(raw)
+    } catch {
+      // fall through to inactive_orders
+    }
+
+    try {
+      const inactives = await this.fetchInactiveOrders()
+      const raw = inactives.find(r => tigerIdMatchesRequested(r.id, orderId))
       return raw ? tigerOrderToOpenOrder(raw) : null
     } catch {
       return null
@@ -637,7 +807,7 @@ export class TigerBroker implements IBroker {
     try {
       const data = await this.client.execute('orders', {
         account: this.account,
-        id: parseInt(orderId, 10),
+        id: orderId,
         lang: 'en_US',
       })
 
@@ -669,14 +839,82 @@ export class TigerBroker implements IBroker {
    * Fetch all currently pending orders via the `active_orders` endpoint.
    * Unlike `orders`, this reliably includes STP / STP_LMT / TRAIL orders.
    * Response shape matches TigerOrderRaw (same schema as the `orders` endpoint).
+   *
+   * IMPORTANT: Tiger's `active_orders` endpoint applies a *default time
+   * window* server-side when `start_date` is omitted — empirically ~24h
+   * looking back from "now". Long-lived GTC stop orders placed days or
+   * weeks ago are pending on Tiger's side (and still reserving inventory)
+   * but become invisible here, which makes Alice think "no stops exist"
+   * and re-submit duplicates that Tiger then rejects with
+   * "quantity exceeds current holdings". We explicitly broaden the window
+   * to 365 days so GTC orders remain discoverable for their entire useful
+   * lifetime. Tiger's official Python SDK example (`nasdaq100.py`) passes
+   * an explicit `start_time` for the same reason.
    */
   private async fetchActiveOrders(): Promise<TigerOrderRaw[]> {
     const data = await this.client.execute('active_orders', {
       account: this.account,
       market: 'ALL',
       lang: 'en_US',
+      start_date: Date.now() - ORDER_LOOKBACK_MS,
+      end_date: Date.now(),
     })
     return extractItems<TigerOrderRaw>(data)
+  }
+
+  /**
+   * Fetch recently rejected/cancelled orders via the `inactive_orders` endpoint
+   * (the same service Tiger Python SDK's `get_cancelled_orders` hits).
+   *
+   * REJECTED orders in Tiger surface here with status='Inactive', and the
+   * `remark`/`reason` field carries the exchange's actual rejection reason —
+   * which our `tigerStatusToOrderState` lifts into `OrderState.rejectReason`
+   * so the AI / sync layer can present it to the user.
+   *
+   * The endpoint paginates server-side; default page is typically 100 recent
+   * inactive orders, which is plenty for "did this id I just placed get
+   * rejected" lookups. No filtering applied here so we can resolve any ID
+   * regardless of symbol/market.
+   */
+  private async fetchInactiveOrders(): Promise<TigerOrderRaw[]> {
+    // Same time-window gotcha as `active_orders` (see fetchActiveOrders): no
+    // start_date means Tiger only returns very recent rejects.
+    const data = await this.client.execute('inactive_orders', {
+      account: this.account,
+      market: 'ALL',
+      lang: 'en_US',
+      start_date: Date.now() - ORDER_LOOKBACK_MS,
+      end_date: Date.now(),
+    })
+    const items = extractItems<TigerOrderRaw>(data)
+
+    // One-line diagnostic dump per *newly observed* rejected order. Deduped
+    // by id via `loggedRejectedOrderIds` because Tiger keeps rejected orders
+    // in the `inactive_orders` window for up to a year, and every fallback
+    // call would otherwise re-print the same dozens of historical rejects.
+    // We still surface the reason field so the operator can verify whether
+    // Tiger populates `remark` vs `attrDesc` on first sight of each rejection.
+    for (const raw of items) {
+      // Tiger ships both wire values ("Inactive", "Invalid") and legacy
+      // enum names ("REJECTED", "INACTIVE", "INVALID"). Normalise both
+      // shapes so the diagnostic actually fires for every rejection.
+      const norm = (raw.status ?? '').replace(/_/g, '').toUpperCase()
+      if (norm !== 'REJECTED' && norm !== 'INACTIVE' && norm !== 'INVALID' && norm !== 'EXPIRED') continue
+
+      const idKey = tigerIdToString(raw.id) ?? `noid:${raw.orderId ?? '?'}:${raw.symbol ?? '?'}`
+      if (this.loggedRejectedOrderIds.has(idKey)) continue
+      this.loggedRejectedOrderIds.add(idKey)
+
+      console.warn(
+        `TigerBroker[${this.id}] rejected_order id=${raw.id ?? '?'} ` +
+        `symbol=${raw.symbol ?? '?'} type=${raw.orderType ?? '?'} ` +
+        `tif=${raw.timeInForce ?? '?'} status=${raw.status ?? '?'} ` +
+        `remark=${JSON.stringify(raw.remark ?? null)} ` +
+        `attrDesc=${JSON.stringify(raw.attrDesc ?? null)}`,
+      )
+    }
+
+    return items
   }
 
   /**

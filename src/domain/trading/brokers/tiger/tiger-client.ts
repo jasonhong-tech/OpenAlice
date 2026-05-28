@@ -90,7 +90,8 @@ export class TigerClient {
       throw new BrokerError('NETWORK', `Tiger gateway HTTP ${res.status}: ${res.statusText}`)
     }
 
-    const json = await res.json() as TigerApiResponse
+    const responseText = await res.text()
+    const json = parseTigerJsonPreservingInt64(responseText) as TigerApiResponse
 
     if (json.code !== 0) {
       const errorMsg = `Tiger API error ${json.code}: ${json.message}`
@@ -101,7 +102,7 @@ export class TigerClient {
     // endpoints (e.g. assets, quote_real_time) and as a JSON object for others (e.g. contracts).
     // Transparently parse the string here so all callers receive a plain JS value.
     const raw = json.data
-    return typeof raw === 'string' ? JSON.parse(raw) : raw
+    return typeof raw === 'string' ? parseTigerJsonPreservingInt64(raw) : raw
   }
 }
 
@@ -147,15 +148,145 @@ function normalizePem(privateKey: string): string {
  * Serialize biz_content as compact JSON with sorted keys, omitting null/undefined.
  * Tiger's Python SDK uses: json.dumps(sort_keys=True, separators=(',', ':'))
  */
-function serializeBizContent(obj: Record<string, unknown>): string {
-  const sorted: Record<string, unknown> = {}
-  for (const key of Object.keys(obj).sort()) {
-    const val = obj[key]
-    if (val !== null && val !== undefined) {
-      sorted[key] = val
+const RAW_INTEGER_FIELDS = new Set(['id', 'order_id', 'parent_id'])
+
+export function serializeBizContent(obj: Record<string, unknown>): string {
+  return serializeJsonValue(obj)
+}
+
+function serializeJsonValue(value: unknown, key?: string): string {
+  if (value === null || value === undefined) return 'null'
+
+  if (typeof value === 'string') {
+    // Tiger's Python SDK serializes order ids as JSON numbers, but those ids
+    // are int64 and exceed JavaScript's safe integer range. Keep the caller's
+    // decimal string exact while emitting the same numeric JSON shape.
+    if (key && RAW_INTEGER_FIELDS.has(key) && isDecimalIntegerString(value)) {
+      return value
     }
+    return JSON.stringify(value)
   }
-  return JSON.stringify(sorted)
+
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return JSON.stringify(value)
+  }
+
+  if (typeof value === 'bigint') {
+    return value.toString()
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map(v => serializeJsonValue(v)).join(',')}]`
+  }
+
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    const parts: string[] = []
+    for (const childKey of Object.keys(obj).sort()) {
+      const childValue = obj[childKey]
+      if (childValue === null || childValue === undefined) continue
+      parts.push(`${JSON.stringify(childKey)}:${serializeJsonValue(childValue, childKey)}`)
+    }
+    return `{${parts.join(',')}}`
+  }
+
+  return JSON.stringify(value)
+}
+
+/**
+ * Parse Tiger JSON without losing int64 order ids.
+ *
+ * Native JSON.parse turns `43152459534700541` into the nearest IEEE-754
+ * double (`43152459534700540`). Python's SDK does not have this problem
+ * because Python ints are arbitrary precision. We quote unsafe integer
+ * literals before parsing so ids arrive as decimal strings.
+ */
+export function parseTigerJsonPreservingInt64(text: string): unknown {
+  return JSON.parse(quoteUnsafeIntegerLiterals(text))
+}
+
+function quoteUnsafeIntegerLiterals(input: string): string {
+  let out = ''
+  let i = 0
+  let inString = false
+  let escaped = false
+
+  while (i < input.length) {
+    const ch = input[i]
+
+    if (inString) {
+      out += ch
+      if (escaped) {
+        escaped = false
+      } else if (ch === '\\') {
+        escaped = true
+      } else if (ch === '"') {
+        inString = false
+      }
+      i++
+      continue
+    }
+
+    if (ch === '"') {
+      inString = true
+      out += ch
+      i++
+      continue
+    }
+
+    if (ch === '-' || isDigit(ch)) {
+      const start = i
+      if (ch === '-') i++
+
+      const intStart = i
+      while (i < input.length && isDigit(input[i])) i++
+      const intPart = input.slice(intStart, i)
+
+      let hasFractionOrExponent = false
+      if (input[i] === '.') {
+        hasFractionOrExponent = true
+        i++
+        while (i < input.length && isDigit(input[i])) i++
+      }
+      if (input[i] === 'e' || input[i] === 'E') {
+        hasFractionOrExponent = true
+        i++
+        if (input[i] === '+' || input[i] === '-') i++
+        while (i < input.length && isDigit(input[i])) i++
+      }
+
+      const token = input.slice(start, i)
+      if (!hasFractionOrExponent && intPart && isUnsafeIntegerLiteral(token)) {
+        out += JSON.stringify(token)
+      } else {
+        out += token
+      }
+      continue
+    }
+
+    out += ch
+    i++
+  }
+
+  return out
+}
+
+function isDigit(ch: string | undefined): boolean {
+  return ch != null && ch >= '0' && ch <= '9'
+}
+
+function isDecimalIntegerString(value: string): boolean {
+  return /^(?:0|[1-9]\d*)$/.test(value)
+}
+
+function isUnsafeIntegerLiteral(token: string): boolean {
+  try {
+    const n = BigInt(token)
+    const max = BigInt(Number.MAX_SAFE_INTEGER)
+    return n > max || n < -max
+  } catch {
+    return false
+  }
 }
 
 /**

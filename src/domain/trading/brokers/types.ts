@@ -90,6 +90,28 @@ export interface PlaceOrderResult {
 
 /** An open/completed order triplet as returned by getOrders(). */
 export interface OpenOrder {
+  /**
+   * Canonical, broker-side stable order identifier as a string.
+   *
+   * This is the ID to pass to `cancelOrder` / `modifyOrder` / `getOrder` and
+   * the ID the AI should reference. It is *broker-specific*:
+   *   - Tiger: the global int64 `id` (e.g. `"43204393769504770"`), NOT the
+   *     account-level small-int `orderId` — Tiger's `cancel_order` /
+   *     `modify_order` endpoints both key off the global `id`.
+   *   - IBKR: stringified `Order.orderId` (numeric, fits in JS Number).
+   *   - Alpaca: the order UUID (string).
+   *   - CCXT: the exchange-assigned order id (already a string).
+   *   - Mock: the internal mock id.
+   *
+   * Kept as a string so 64-bit broker ids (like Tiger's snowflake-style ids
+   * that exceed `Number.MAX_SAFE_INTEGER`) survive the trip through JSON,
+   * the tool layer, and the AI — without silent precision loss.
+   *
+   * NOTE: `order.orderId` (numeric, from IBKR `Order`) is the *client-assigned*
+   * placement id and is NOT a safe canonical identifier across brokers — use
+   * this top-level `orderId` instead for any lookup / cancel / modify call.
+   */
+  orderId: string
   contract: Contract
   order: Order
   orderState: OrderState
@@ -203,6 +225,20 @@ export interface IBroker<TMeta = unknown> {
   getPositions(): Promise<Position[]>
   getOrders(orderIds: string[]): Promise<OpenOrder[]>
   getOrder(orderId: string): Promise<OpenOrder | null>
+
+  /**
+   * Enumerate every currently-open order on the broker side, including
+   * long-lived GTC orders that pre-date this OpenAlice instance and orphan
+   * stops that aren't tracked in our local git history. Returns an empty
+   * array when the broker does not surface this directly. Used by the AI
+   * to detect orphan reservations that are silently locking inventory
+   * (e.g. the "exceeds current holdings" rejection pattern on Tiger when
+   * old GTC stops still hold the shares).
+   *
+   * Optional — brokers without a "list all open orders" endpoint can omit it.
+   */
+  listOpenOrders?(): Promise<OpenOrder[]>
+
   getQuote(contract: Contract): Promise<Quote>
   getMarketClock(): Promise<MarketClock>
 

@@ -424,6 +424,8 @@ export class AlpacaBroker implements IBroker {
     order.orderId = 0
 
     return {
+      // Alpaca's canonical id is the UUID string `o.id`.
+      orderId: o.id,
       contract,
       order,
       orderState: makeOrderState(o.status, o.reject_reason ?? undefined),

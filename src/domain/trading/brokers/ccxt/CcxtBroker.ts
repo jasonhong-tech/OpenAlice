@@ -551,6 +551,8 @@ export class CcxtBroker implements IBroker<CcxtBrokerMeta> {
     order.orderId = parseInt(o.id, 10) || 0
 
     return {
+      // CCXT's `id` is the exchange-assigned order id (already a string).
+      orderId: String(o.id),
       contract,
       order,
       orderState: makeOrderState(o.status),

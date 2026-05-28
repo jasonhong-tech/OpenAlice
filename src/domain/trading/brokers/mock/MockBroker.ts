@@ -109,7 +109,8 @@ export function makeOpenOrder(overrides: Partial<OpenOrder> = {}): OpenOrder {
   if (!overrides.orderState) {
     orderState.status = 'Filled'
   }
-  return { contract, order, orderState }
+  const orderId = overrides.orderId ?? (order.orderId ? String(order.orderId) : 'mock-ord-1')
+  return { orderId, contract, order, orderState }
 }
 
 export function makePlaceOrderResult(overrides: Partial<PlaceOrderResult> = {}): PlaceOrderResult {
@@ -373,7 +374,7 @@ export class MockBroker implements IBroker {
     if (!internal) return null
     const orderState = new OrderState()
     orderState.status = internal.status
-    return { contract: internal.contract, order: internal.order, orderState }
+    return { orderId: internal.id, contract: internal.contract, order: internal.order, orderState }
   }
 
   async getQuote(contract: Contract): Promise<Quote> {

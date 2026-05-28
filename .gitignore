@@ -33,3 +33,4 @@ packages/ibkr/ref/samples/Cpp/
 packages/ibkr/ref/CMakeLists.txt
 
 tiger_docs/
+snaptrade-typescript-sdk/

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { ContractDescription } from '@traderalice/ibkr'
-import { MockBroker, makeContract } from '../domain/trading/brokers/mock/index.js'
+import { ContractDescription, Order, OrderState } from '@traderalice/ibkr'
+import Decimal from 'decimal.js'
+import { MockBroker, makeContract, makeOpenOrder } from '../domain/trading/brokers/mock/index.js'
 import { AccountManager } from '../domain/trading/account-manager.js'
 import { UnifiedTradingAccount } from '../domain/trading/UnifiedTradingAccount.js'
 import { createTradingTools } from './trading.js'
@@ -96,5 +97,110 @@ describe('createTradingTools — searchContracts', () => {
     const tools = createTradingTools(mgr)
     const result = await (tools.searchContracts.execute as Function)({ pattern: 'AAPL' })
     expect(result).toHaveLength(2)
+  })
+})
+
+// ==================== createTradingTools: listOpenOrders / getOrders shape ====================
+
+/**
+ * These tests pin the *flattened* response shape of `listOpenOrders` and
+ * `getOrders`. The AI consumed `OpenOrder` directly before and consistently
+ * picked the wrong id-shaped field (`order.orderId`, which for Tiger is the
+ * account-level small int, not the canonical global id). Flattening removes
+ * the ambiguity, and these tests guarantee the flat shape stays flat and
+ * never accidentally re-exposes a second id-shaped field.
+ */
+describe('createTradingTools — listOpenOrders flattened response shape', () => {
+  function makeStpOrder(): ReturnType<typeof makeOpenOrder> {
+    // Mimic Tiger's two-id reality: top-level canonical (global int64-shaped
+    // string) + inner IBKR-numeric account-level id that must NOT leak.
+    const contract = makeContract({ symbol: 'MSFT', secType: 'STK', currency: 'USD' })
+    const order = new Order()
+    order.orderId = 21
+    order.action = 'SELL'
+    order.orderType = 'STP'
+    order.totalQuantity = new Decimal(10)
+    order.auxPrice = 400
+    order.tif = 'GTC'
+    const orderState = new OrderState()
+    orderState.status = 'Submitted'
+    return { orderId: '43204393769504770', contract, order, orderState }
+  }
+
+  it('flattens listOpenOrders output to a single canonical orderId', async () => {
+    const broker = new MockBroker({ id: 'tiger-main' })
+    const stp = makeStpOrder()
+    ;(broker as unknown as { listOpenOrders: () => Promise<unknown> }).listOpenOrders = vi.fn().mockResolvedValue([stp])
+
+    const mgr = makeManager(broker)
+    const tools = createTradingTools(mgr)
+    const result = await (tools.listOpenOrders.execute as Function)({ source: 'tiger-main' })
+
+    expect(result).toHaveLength(1)
+    const o = result[0] as Record<string, unknown>
+    expect(o.orderId).toBe('43204393769504770')
+    expect(o.symbol).toBe('MSFT')
+    expect(o.orderType).toBe('STP')
+    expect(o.tif).toBe('GTC')
+    expect(o.status).toBe('Submitted')
+    expect(o.auxPrice).toBe(400)
+    expect(o.action).toBe('SELL')
+    expect(o.totalQuantity).toBe(10)
+  })
+
+  it('does NOT leak the inner `order` object (would expose the wrong account-level id)', async () => {
+    const broker = new MockBroker({ id: 'tiger-main' })
+    const stp = makeStpOrder()
+    ;(broker as unknown as { listOpenOrders: () => Promise<unknown> }).listOpenOrders = vi.fn().mockResolvedValue([stp])
+
+    const mgr = makeManager(broker)
+    const tools = createTradingTools(mgr)
+    const result = await (tools.listOpenOrders.execute as Function)({ source: 'tiger-main' })
+
+    const o = result[0] as Record<string, unknown>
+    // The IBKR-numeric `order.orderId = 21` (account-level small int) is the
+    // exact value that caused the AI to feed bad ids into cancel/modify; the
+    // flat response must never carry it.
+    expect(o.order).toBeUndefined()
+    expect(o.contract).toBeUndefined()
+    expect(o.orderState).toBeUndefined()
+    expect(o.orderId).not.toBe('21')
+    expect(o.orderId).not.toBe(21)
+  })
+
+  it('omits optional fields when unset and includes rejectReason when present', async () => {
+    const broker = new MockBroker({ id: 'tiger-main' })
+    const stp = makeStpOrder()
+    stp.orderState.status = 'Inactive'
+    stp.orderState.rejectReason = 'The order quantity you entered exceeds your current holdings'
+    ;(broker as unknown as { listOpenOrders: () => Promise<unknown> }).listOpenOrders = vi.fn().mockResolvedValue([stp])
+
+    const mgr = makeManager(broker)
+    const tools = createTradingTools(mgr)
+    const result = await (tools.listOpenOrders.execute as Function)({ source: 'tiger-main' })
+
+    const o = result[0] as Record<string, unknown>
+    expect(o.status).toBe('Inactive')
+    expect(o.rejectReason).toContain('exceeds your current holdings')
+    expect(o).not.toHaveProperty('lmtPrice')
+    expect(o).not.toHaveProperty('trailingPercent')
+    expect(o).not.toHaveProperty('avgFillPrice')
+  })
+
+  it('getOrders applies the same flattening', async () => {
+    const broker = new MockBroker({ id: 'tiger-main' })
+    const stp = makeStpOrder()
+    broker.getOrders = vi.fn().mockResolvedValue([stp])
+
+    const mgr = makeManager(broker)
+    const tools = createTradingTools(mgr)
+    const result = await (tools.getOrders.execute as Function)({
+      source: 'tiger-main',
+      orderIds: ['43204393769504770'],
+    })
+
+    const o = result[0] as Record<string, unknown>
+    expect(o.orderId).toBe('43204393769504770')
+    expect(o.order).toBeUndefined()
   })
 })

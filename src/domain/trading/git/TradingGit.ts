@@ -382,6 +382,7 @@ export class TradingGit implements ITradingGit {
         status: u.currentStatus,
         filledQty: u.filledQty,
         filledPrice: u.filledPrice,
+        rejectReason: u.rejectReason,
       })),
       stateAfter: currentState,
       timestamp: new Date().toISOString(),

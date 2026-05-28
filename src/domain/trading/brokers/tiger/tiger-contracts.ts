@@ -18,6 +18,7 @@ import Decimal from 'decimal.js'
 import type { ContractDescription, ContractDetails } from '@traderalice/ibkr'
 import type {
   TigerContractRaw,
+  TigerInt,
   TigerOrderRaw,
   TigerPositionRaw,
   TigerAssetRaw,
@@ -171,7 +172,7 @@ function tigerExchangeToIbkr(exchange: string): string {
 export function tigerOrderToIbkr(raw: TigerOrderRaw): Order {
   const o = new Order()
   // Tiger uses "orderId" (camelCase) in order JSON
-  o.orderId = raw.orderId ?? 0
+  o.orderId = tigerIdToSafeNumber(raw.orderId) ?? 0
   o.action = (raw.action ?? 'BUY') as 'BUY' | 'SELL'
   // Tiger uses "orderType" (camelCase)
   o.orderType = tigerOrderTypeToIbkr(raw.orderType ?? 'LMT')
@@ -224,29 +225,95 @@ export function ibkrOrderTypeToTiger(orderType: string): string {
 
 /**
  * Build IBKR OrderState from Tiger order status string.
+ *
+ * The optional `reason` (Tiger's `remark` / `reason` field) is surfaced into
+ * `OrderState.rejectReason` and `OrderState.warningText` for any non-active
+ * terminal status, so the AI / sync layer can see *why* an order got rejected
+ * or cancelled by the exchange (tick-size violation, insufficient buying power,
+ * permission missing, etc.) instead of just a bare "Inactive" status.
  */
-export function tigerStatusToOrderState(status: string): OrderState {
+export function tigerStatusToOrderState(status: string, reason?: string | null): OrderState {
   const os = new OrderState()
   os.status = tigerStatusToIbkr(status)
+  if (reason && isTerminalRejectedStatus(os.status)) {
+    os.rejectReason = reason
+    os.warningText = reason
+  }
   return os
+}
+
+function isTerminalRejectedStatus(ibkrStatus: string): boolean {
+  return ibkrStatus === 'Inactive' || ibkrStatus === 'Cancelled'
 }
 
 /**
  * Map Tiger order status to IBKR order status string.
+ *
+ * Tiger sends two flavours of status string over the wire:
+ *
+ *   1. Enum *values* — `'PendingNew'`, `'Initial'`, `'Submitted'`,
+ *      `'PartiallyFilled'`, `'Filled'`, `'PendingCancel'`, `'Cancelled'`,
+ *      `'Inactive'`, `'Invalid'`, plus the legacy aliases `'New'`, `'Held'`,
+ *      `'PendingSubmit'`. (See `OrderStatus` enum + `get_order_status` in
+ *      the Python SDK — full list of accepted values in the SDK's
+ *      docstring: `Invalid(-2), Initial(-1), PendingCancel(3), Cancelled(4),
+ *      Submitted(5), Filled(6), Inactive(7), PendingSubmit(8)`.)
+ *   2. Enum *names* — `'PENDING_NEW'`, `'PENDING_CANCEL'`, etc. (rare —
+ *      mostly only push-channel payloads). Kept for safety.
+ *
+ * The previous version of this map only listed enum names, so any
+ * wire-value status (`'PendingNew'`, `'Initial'`, `'PendingSubmit'`, ...)
+ * fell through and the *raw* string was returned. That worked for
+ * `'Submitted'` and `'Filled'` by coincidence — they happen to match IBKR
+ * spellings — but `'Initial'`, `'PendingNew'`, `'Held'`, `'PendingSubmit'`
+ * leaked through and broke `UnifiedTradingAccount.sync()`, which uses
+ * `status !== 'Submitted' && status !== 'PreSubmitted'` as the
+ * "is the order terminal" check; an `'Initial'` or `'Held'` status would
+ * be misread as a terminal `rejected`.
+ *
+ * Mapping rationale to IBKR conventions:
+ *   - Tiger `Initial` / `New` / `PendingNew` are "received-but-not-yet-
+ *     routed" states (numerical -1 in the SDK docstring) ⇒ IBKR
+ *     `PreSubmitted` (parked at broker, hasn't reached the exchange yet).
+ *   - Tiger `Submitted` / `PendingSubmit` / `Held` are **all the same
+ *     live-on-exchange state** semantically. The Python SDK's
+ *     `get_order_status` lumps `'Submitted'`, `'PendingSubmit'`, `'Held'`,
+ *     `'HELD'` and the numerical codes 2/5/8 under one canonical
+ *     `OrderStatus.HELD` bucket. We therefore map all of them to IBKR
+ *     `'Submitted'` — anything else makes long-lived GTC stops show up
+ *     as "PreSubmitted" in OpenAlice even though Tiger considers them
+ *     live and is happily reserving inventory against them.
+ *   - Tiger `Inactive` / `Rejected` ⇒ IBKR `Inactive`.
+ *   - Tiger `Invalid` / `Expired` ⇒ IBKR `Inactive` (closest IBKR concept).
  */
 function tigerStatusToIbkr(status: string): string {
-  const map: Record<string, string> = {
-    PENDING_NEW: 'Submitted',
-    NEW: 'Submitted',
-    PARTIALLY_FILLED: 'PartiallyFilled',
-    FILLED: 'Filled',
-    PENDING_CANCEL: 'PendingCancel',
-    CANCELLED: 'Cancelled',
-    REJECTED: 'Inactive',
-    EXPIRED: 'Inactive',
-    HELD: 'Submitted',
+  const norm = status.replace(/_/g, '').toUpperCase()
+  switch (norm) {
+    case 'INITIAL':
+    case 'NEW':
+    case 'PENDINGNEW':
+      return 'PreSubmitted'
+    case 'SUBMITTED':
+    case 'PENDINGSUBMIT':
+    case 'HELD':
+      return 'Submitted'
+    case 'PARTIALLYFILLED':
+      return 'PartiallyFilled'
+    case 'FILLED':
+      return 'Filled'
+    case 'PENDINGCANCEL':
+      return 'PendingCancel'
+    case 'CANCELLED':
+    case 'CANCELED':
+      return 'Cancelled'
+    case 'INACTIVE':
+    case 'REJECTED':
+    case 'INVALID':
+    case 'EXPIRED':
+      return 'Inactive'
+    default:
+      return status
   }
-  return map[status.toUpperCase()] ?? status
 }
 
 /**
@@ -265,15 +332,67 @@ export function tigerOrderToOpenOrder(raw: TigerOrderRaw): OpenOrder {
   if (raw.exchange) c.exchange = tigerExchangeToIbkr(raw.exchange)
 
   const order = tigerOrderToIbkr(raw)
-  const orderState = tigerStatusToOrderState(raw.status ?? '')
+  // `remark` is Tiger's canonical reason field (maps to `reason` in the Python
+  // SDK). For some rejections Tiger leaves it null and stuffs context into
+  // `attrDesc` instead, so we use that as a fallback before giving up.
+  const reason = raw.remark || raw.attrDesc || null
+  const orderState = tigerStatusToOrderState(raw.status ?? '', reason)
+
+  // Canonical broker-side id is Tiger's global `id` (int64). Tiger's
+  // `cancel_order` and `modify_order` endpoints both key off this field
+  // (see Python SDK: `client.cancel_order(id=order.id)`). The account-
+  // level `orderId` (small int, kept on `order.orderId`) is per-account
+  // and cannot be safely used to identify the order globally.
+  // Fall back to `orderId` only if Tiger somehow omits `id`.
+  const canonicalId = tigerIdToString(raw.id) ?? tigerIdToString(raw.orderId) ?? ''
 
   return {
+    orderId: canonicalId,
     contract: c,
     order,
     orderState,
     // Tiger uses "avgFillPrice" (camelCase)
     avgFillPrice: raw.avgFillPrice,
   }
+}
+
+export function tigerIdToString(id: TigerInt | null | undefined): string | undefined {
+  if (id == null) return undefined
+  if (typeof id === 'string') return id
+  if (!Number.isFinite(id)) return undefined
+  return String(Math.trunc(id))
+}
+
+export function tigerIdToSafeNumber(id: TigerInt | null | undefined): number | undefined {
+  if (id == null) return undefined
+  if (typeof id === 'number') return Number.isSafeInteger(id) ? id : undefined
+  if (!isDecimalIntegerString(id)) return undefined
+  const n = Number(id)
+  return Number.isSafeInteger(n) ? n : undefined
+}
+
+export function tigerIdMatchesRequested(rawId: TigerInt | null | undefined, requestedId: string): boolean {
+  const exact = tigerIdToString(rawId)
+  if (!exact) return false
+  if (exact === requestedId) return true
+
+  // Compatibility for ids persisted before TigerClient preserved int64 values.
+  // `Number("43152459534700541").toString()` becomes
+  // "43152459534700540"; match that legacy rounded spelling so old staged
+  // cancels/modifies can resolve to the fresh exact id from active_orders.
+  return legacyRoundedTigerId(exact) === requestedId
+}
+
+export function legacyRoundedTigerId(id: TigerInt | null | undefined): string | undefined {
+  const exact = tigerIdToString(id)
+  if (!exact || !isDecimalIntegerString(exact)) return undefined
+  if (tigerIdToSafeNumber(exact) != null) return exact
+  const rounded = Number(exact)
+  return Number.isFinite(rounded) ? String(rounded) : undefined
+}
+
+function isDecimalIntegerString(value: string): boolean {
+  return /^(?:0|[1-9]\d*)$/.test(value)
 }
 
 // ==================== Position conversion ====================

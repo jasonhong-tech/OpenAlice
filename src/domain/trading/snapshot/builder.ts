@@ -52,7 +52,11 @@ export async function buildSnapshot(
       openOrders: orders
         .filter(o => o.orderState.status === 'Submitted' || o.orderState.status === 'PreSubmitted')
         .map(o => ({
-          orderId: String(o.order.orderId),
+          // Use the broker-side canonical id (string-safe, supports Tiger's
+          // 64-bit global ids) rather than the IBKR-numeric `order.orderId`,
+          // which for Tiger is the account-level small int and cannot be
+          // round-tripped to `cancelOrder` / `modifyOrder`.
+          orderId: o.orderId,
           aliceId: o.contract.aliceId ?? uta.broker.getNativeKey(o.contract),
           action: o.order.action,
           orderType: o.order.orderType,

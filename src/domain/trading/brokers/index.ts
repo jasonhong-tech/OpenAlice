@@ -32,3 +32,7 @@ export type { IbkrBrokerConfig } from './ibkr/index.js'
 // Tiger Trade
 export { TigerBroker } from './tiger/index.js'
 export type { TigerBrokerConfig } from './tiger/index.js'
+
+// SnapTrade
+export { SnaptradeBroker } from './snaptrade/index.js'
+export type { SnaptradeBrokerConfig } from './snaptrade/index.js'

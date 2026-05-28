@@ -37,12 +37,14 @@ export interface TigerApiResponse {
   data?: unknown
 }
 
+export type TigerInt = number | string
+
 export interface TigerOrderIdData {
-  id?: number           // global Tiger order ID (int64) — present in place_order response
-  orderId?: number      // account-level order ID — camelCase (primary from order_no)
-  order_id?: number     // account-level order ID — snake_case fallback (some API versions)
-  subIds?: number[]     // sub-order IDs (camelCase)
-  sub_ids?: number[]    // sub-order IDs (snake_case fallback)
+  id?: TigerInt           // global Tiger order ID (int64) — present in place_order response
+  orderId?: TigerInt      // account-level order ID — camelCase (primary from order_no)
+  order_id?: TigerInt     // account-level order ID — snake_case fallback (some API versions)
+  subIds?: TigerInt[]     // sub-order IDs (camelCase)
+  sub_ids?: TigerInt[]    // sub-order IDs (snake_case fallback)
 }
 
 /**
@@ -111,8 +113,8 @@ export interface TigerPositionRaw {
  *   "trailingPercent"→ trailing_percent
  */
 export interface TigerOrderRaw {
-  id?: number              // global Tiger order ID (int64)
-  orderId?: number         // account-level order ID
+  id?: TigerInt            // global Tiger order ID (int64)
+  orderId?: TigerInt       // account-level order ID
   account?: string
   // Contract fields (flat, not nested):
   symbol?: string
@@ -135,7 +137,12 @@ export interface TigerOrderRaw {
   openTime?: number        // SPECIAL: maps to order_time
   updateTime?: number
   latestTime?: number      // SPECIAL: maps to trade_time
-  remark?: string          // SPECIAL: maps to reason
+  remark?: string          // SPECIAL: maps to reason (downstream rejection reason)
+  attrDesc?: string        // human-readable attribute description (sometimes carries reject context)
+  attrList?: unknown       // structured attribute list (rarely populated)
+  source?: string          // origin marker (e.g. "OpenAPI", "iOS")
+  canModify?: boolean
+  liquidation?: boolean
 }
 
 /**

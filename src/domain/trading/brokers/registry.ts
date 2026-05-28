@@ -12,6 +12,7 @@ import { CcxtBroker } from './ccxt/CcxtBroker.js'
 import { AlpacaBroker } from './alpaca/AlpacaBroker.js'
 import { IbkrBroker } from './ibkr/IbkrBroker.js'
 import { TigerBroker } from './tiger/TigerBroker.js'
+import { SnaptradeBroker } from './snaptrade/SnaptradeBroker.js'
 
 // ==================== Subtitle field descriptor ====================
 
@@ -104,6 +105,20 @@ export const BROKER_REGISTRY: Record<string, BrokerRegistryEntry> = {
     subtitleFields: [
       { field: 'account' },
       { field: 'paper', label: 'Paper', falseLabel: 'Live' },
+    ],
+    guardCategory: 'securities',
+  },
+  snaptrade: {
+    configSchema: SnaptradeBroker.configSchema,
+    configFields: SnaptradeBroker.configFields,
+    fromConfig: SnaptradeBroker.fromConfig,
+    name: 'SnapTrade',
+    description: 'Connect and trade supported brokerage accounts through SnapTrade using user-scoped account credentials.',
+    badge: 'ST',
+    badgeColor: 'text-sky-400',
+    subtitleFields: [
+      { field: 'accountId', prefix: 'Account ' },
+      { field: 'userId', prefix: 'User ' },
     ],
     guardCategory: 'securities',
   },

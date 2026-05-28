@@ -316,8 +316,8 @@ export class IbkrBroker implements IBroker {
   async getOrders(orderIds: string[]): Promise<OpenOrder[]> {
     const allOrders = await this.bridge.requestOpenOrders()
     return allOrders
-      .filter(o => orderIds.includes(String(o.order.orderId)))
       .map(o => this.enrichWithFillData(o))
+      .filter(o => orderIds.includes(o.orderId))
   }
 
   async getOrder(orderId: string): Promise<OpenOrder | null> {
@@ -327,14 +327,17 @@ export class IbkrBroker implements IBroker {
 
     // Fallback to completed orders (filled/cancelled orders leave the open list)
     const completed = await this.bridge.requestCompletedOrders()
-    const match = completed.find(o => String(o.order.orderId) === orderId)
-    return match ? this.enrichWithFillData(match) : null
+    const enriched = completed.map(o => this.enrichWithFillData(o))
+    return enriched.find(o => o.orderId === orderId) ?? null
   }
 
   /** Attach avgFillPrice from cached orderStatus data if available. */
   private enrichWithFillData(o: import('./ibkr-types.js').CollectedOpenOrder): OpenOrder {
     const fillData = this.bridge.getFillData(o.order.orderId)
     return {
+      // IBKR's numeric Order.orderId IS the canonical identifier and always
+      // fits in JS Number safely (TWS keeps it well below MAX_SAFE_INTEGER).
+      orderId: String(o.order.orderId),
       contract: o.contract,
       order: o.order,
       orderState: o.orderState,

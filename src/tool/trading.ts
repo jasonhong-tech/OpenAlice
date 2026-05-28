@@ -10,8 +10,65 @@ import { tool, type Tool } from 'ai'
 import { z } from 'zod'
 import { Contract } from '@traderalice/ibkr'
 import type { AccountManager } from '@/domain/trading/account-manager.js'
-import { BrokerError } from '@/domain/trading/brokers/types.js'
+import { BrokerError, type OpenOrder } from '@/domain/trading/brokers/types.js'
+import type { UnifiedTradingAccount } from '@/domain/trading/UnifiedTradingAccount.js'
 import '@/domain/trading/contract-ext.js'
+
+/**
+ * IBKR's `Order` class initialises every numeric field to a sentinel
+ * (`UNSET_DOUBLE = Number.MAX_VALUE` ≈ `1.79e+308`) rather than `undefined`,
+ * so a naive `value != null` check leaks "1.79e+308" into the AI's view of
+ * orders that simply don't have a limit / aux / trailing price. We treat
+ * the sentinel as the same thing as "not set".
+ */
+const UNSET_DOUBLE = Number.MAX_VALUE
+function isSetNumber(v: number | undefined | null): v is number {
+  return v != null && v !== UNSET_DOUBLE
+}
+
+/**
+ * Project an `OpenOrder` into a *flat*, AI-friendly shape with a single
+ * canonical `orderId` field.
+ *
+ * Rationale: the raw `OpenOrder` carries TWO id-shaped fields — the
+ * broker-canonical top-level `orderId` (string, the one cancel/modify
+ * actually wants) and the IBKR-legacy `order.orderId` (numeric, which on
+ * Tiger is the *account-level* small int that cannot be used for cancel /
+ * modify). When we passed the raw object through, the AI consistently
+ * picked `order.orderId` (because that's the IBKR-classic location) and
+ * fed e.g. `"21"` back into `modifyOrder`, which then failed silently
+ * because Tiger's `modify_order` keys off the 17-digit global id.
+ *
+ * Flattening to a single explicit shape removes the ambiguity at the
+ * boundary and is also significantly more compact in the AI's context
+ * window — we drop dozens of bytes of IBKR Order/Contract noise the AI
+ * never reads.
+ */
+function serializeOpenOrder(uta: UnifiedTradingAccount, o: OpenOrder): Record<string, unknown> {
+  const c = o.contract
+  const ord = o.order
+  const st = o.orderState
+  return {
+    source: uta.id,
+    orderId: o.orderId,
+    aliceId: c.aliceId ?? uta.broker.getNativeKey(c),
+    symbol: c.symbol,
+    secType: c.secType,
+    ...(c.currency ? { currency: c.currency } : {}),
+    ...(c.exchange ? { exchange: c.exchange } : {}),
+    action: ord.action,
+    orderType: ord.orderType,
+    totalQuantity: ord.totalQuantity?.toNumber(),
+    ...(isSetNumber(ord.lmtPrice) ? { lmtPrice: ord.lmtPrice } : {}),
+    ...(isSetNumber(ord.auxPrice) ? { auxPrice: ord.auxPrice } : {}),
+    ...(isSetNumber(ord.trailStopPrice) ? { trailStopPrice: ord.trailStopPrice } : {}),
+    ...(isSetNumber(ord.trailingPercent) ? { trailingPercent: ord.trailingPercent } : {}),
+    tif: ord.tif,
+    status: st.status,
+    ...(st.rejectReason ? { rejectReason: st.rejectReason } : {}),
+    ...(isSetNumber(o.avgFillPrice) ? { avgFillPrice: o.avgFillPrice } : {}),
+  }
+}
 
 /** Classify a broker error into a structured response for AI consumption. */
 function handleBrokerError(err: unknown): { error: string; code: string; transient: boolean; hint: string } {
@@ -143,6 +200,11 @@ If this tool returns an error with transient=true, wait a few seconds and retry 
 
     getOrders: tool({
       description: `Query orders by ID. If no orderIds provided, queries all pending (submitted) orders.
+
+The returned \`orderId\` is the CANONICAL broker-side identifier — pass it
+DIRECTLY to cancelOrder / modifyOrder. Do not synthesize ids from other
+fields; the shape is intentionally flat and has only one id-shaped field.
+
 If this tool returns an error with transient=true, wait a few seconds and retry once before reporting to the user.`,
       inputSchema: z.object({
         source: z.string().optional().describe(sourceDesc(false)),
@@ -155,7 +217,43 @@ If this tool returns an error with transient=true, wait a few seconds and retry 
           const results = await Promise.all(targets.map(async (uta) => {
             const ids = orderIds ?? uta.getPendingOrderIds().map(p => p.orderId)
             const orders = await uta.getOrders(ids)
-            return orders.map((o) => ({ source: uta.id, ...o }))
+            return orders.map((o) => serializeOpenOrder(uta, o))
+          }))
+          return results.flat()
+        } catch (err) {
+          return handleBrokerError(err)
+        }
+      },
+    }),
+
+    listOpenOrders: tool({
+      description: `List EVERY currently-open order on the broker side, including orphan orders
+NOT tracked in OpenAlice's git history (e.g. long-lived GTC stops placed
+days/weeks ago, orders placed via the broker's own app, or stops carried
+over from before this OpenAlice instance was started).
+
+The returned \`orderId\` is the CANONICAL broker-side identifier — pass it
+DIRECTLY to cancelOrder / modifyOrder. On Tiger specifically this is the
+17-digit global id; do NOT try to "shorten" it or extract a sub-id.
+
+Use this when:
+  • A fresh placeOrder gets rejected with "quantity exceeds current holdings"
+    or similar — it usually means a stale GTC order is silently locking
+    the inventory, and you need to find + cancel it via cancelOrder.
+  • You want a definitive reconciliation between broker app and OpenAlice.
+  • Returns [] for brokers that don't expose a list-all endpoint.
+
+If this tool returns an error with transient=true, wait a few seconds and retry once before reporting to the user.`,
+      inputSchema: z.object({
+        source: z.string().optional().describe(sourceDesc(false)),
+      }),
+      execute: async ({ source }) => {
+        const targets = manager.resolve(source)
+        if (targets.length === 0) return []
+        try {
+          const results = await Promise.all(targets.map(async (uta) => {
+            const orders = await uta.listOpenOrders()
+            return orders.map((o) => serializeOpenOrder(uta, o))
           }))
           return results.flat()
         } catch (err) {

@@ -39,6 +39,13 @@ export interface OperationResult {
   orderState?: OrderState
   filledQty?: number
   filledPrice?: number
+  /**
+   * Broker-side reject/cancel reason captured at the time of this commit
+   * (sync, placeOrder, modifyOrder, cancelOrder). Preserves the exchange's
+   * explanation for terminal-rejected orders so `log`/`show` queries can
+   * surface *why* an order died, not just *that* it died.
+   */
+  rejectReason?: string
   error?: string
   raw?: unknown
 }
@@ -137,6 +144,14 @@ export interface OrderStatusUpdate {
   currentStatus: OperationStatus
   filledPrice?: number
   filledQty?: number
+  /**
+   * Broker-side reason for the status transition.
+   * Populated by `UnifiedTradingAccount.sync()` from `OrderState.rejectReason`
+   * (typically Tiger's `remark` field) when an order ends up rejected/cancelled
+   * by the exchange. Surfaces messages like "Insufficient buying power",
+   * "Tick size violation", "Outside trading hours", etc.
+   */
+  rejectReason?: string
 }
 
 export interface SyncResult {
